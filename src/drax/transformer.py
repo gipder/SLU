@@ -26,7 +26,8 @@ from omegaconf.dictconfig import DictConfig
 from torch import Tensor, nn
 
 #from . import rotary
-import rotary
+from drax import rotary
+#import drxrotary
 
 
 def bias_dropout_add_scale(x: Tensor, scale: Tensor, residual: Tensor | None, prob: float, training: bool) -> Tensor:
@@ -144,7 +145,7 @@ class DDiTBlock(nn.Module):
         batch_size, seq_len = x.shape[0], x.shape[1]
 
         # Get modulation parameters for all layers (9 or 6 total)
-        modulation_params = self.adaLN_modulation(c)[:, None].chunk(9, dim=2)
+        modulation_params = self.adaLN_modulation(c)[:, None].chunk(9, dim=2)        
         shift_msa, scale_msa, gate_msa, shift_cross, scale_cross, gate_cross, shift_mlp, scale_mlp, gate_mlp = modulation_params
 
         # Self attention
@@ -233,7 +234,7 @@ class DDitFinalLayer(nn.Module):
         return x
 
 
-class Transformer(nn.Module):
+class DitTransformer(nn.Module):
     def __init__(self, vocab_size: int, masked: bool, config: DictConfig):
         super().__init__()
 
@@ -245,7 +246,8 @@ class Transformer(nn.Module):
 
         add_token = 1 if masked else 0
 
-        self.vocab_embed = nn.Embedding(self.vocab_size + add_token, config.hidden_size)
+        self.vocab_embed = nn.Embedding(self.vocab_size + add_token, config.hidden_size,
+                                        padding_idx=config.pad_id)
 
         self.time_embedding = TimestepEmbedder(hidden_size=config.cond_dim)
 
@@ -444,13 +446,36 @@ if __name__ == "__main__":
     #                n_heads=config.n_heads,
     #                cond_dim=config.cond_dim,
     #                dropout=config.dropout,
-    my_transformer = Transformer(vocab_size=1000, 
+    vocab_size = 650
+    my_transformer = DitTransformer(vocab_size=vocab_size, 
                                  masked=False, 
                                  config={"hidden_size": 256,
                                          "n_heads": 4,
-                                         "cond_dim": 256,
+                                         "cond_dim": vocab_size,
                                          "n_blocks": 6,
                                          "dropout": 0.1,
                                          "whisper_dim": 768})
     # get num of parameters
     print(f"{sum(p.numel() for p in my_transformer.parameters()):,}")
+
+    # running check
+    B=4
+    T=64
+    C=768
+    audio_data = torch.rand((B, T, C))  # batch_size=4, seq_len=64
+    time_data = torch.rand(B,)  # batch_size=4
+    audio_len = torch.randint(0, T, (B,))
+    mask = torch.arange(T).unsqueeze(0).repeat(B, 1) < audio_len.unsqueeze(1)
+    x_0 = torch.zeros((B, T, vocab_size))
+    output = my_transformer(x_t=x_0,
+                   time=time_data,
+                   audio_embeddings=audio_data,
+                   preserve_mask=mask,
+                   audio_projected=None,
+                   audio_k_all=None,
+                   audio_v_all=None,
+                   cfg_strength=1.0,
+                   audio_drop_prob=0.1,
+                   use_gradient_checkpointing=False)
+    print(f"{(mask).long()=}")
+    print(f"{output.shape=}")  # expect (B, T, vocab_size)
