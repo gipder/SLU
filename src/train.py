@@ -17,6 +17,10 @@ from flow_matching.path.scheduler import PolynomialConvexScheduler
 #from flow_matching.solver import MixtureDiscreteEulerSolver
 #from flow_matching.utils import ModelWrapper
 #from flow_matching.loss import MixturePathGeneralizedKL
+from model_wrapper import WrappedModel
+
+# For DFM sampmling
+from sampling import sample
 
 # 1. LLM 모델과 토크나이저 로드 (microsoft/deberta-base 사용)
 model_name = "microsoft/deberta-v3-base"
@@ -90,11 +94,12 @@ loss_mse = nn.MSELoss()
 llambda = 0.1
 
 # configure optimizer
-lr = 1e-4
+lr = 1e-3
 optim = torch.optim.AdamW(dit.parameters(), lr=lr)
-epoch = 10
+epoch = 1000
 batch_size = 256
 save_step = 2000
+num_remain_ckpt = 10
 save_dir = "./exp/init"
 task = "DeBERTa_DiT_SLU"
 # if save dir does not exist, create it
@@ -117,6 +122,7 @@ length_predictor_params = sum(
     p.numel() for p in length_predictor.parameters() if p.requires_grad
     )
 print(f"Total trainable parameters in Length Predictor: {length_predictor_params:,}")
+print(f"Total parameters: {dit_params + length_predictor_params:,}")
 
 # training loop
 step = 0
@@ -202,7 +208,7 @@ for e in range(epoch):
         optim.step()
         if step % 10 == 0:
             print(f"Step {step}, Loss: {loss.item()}")
-
+        """
         if step % save_step == 0 and step > 0:
             save_path = os.path.join(save_dir, f"{task}_step{step}.pt")
             torch.save({
@@ -212,7 +218,7 @@ for e in range(epoch):
                 "step": step,
             }, save_path)
             print(f"Model saved at step {step} to {save_path}")
-
+        """
         step += 1
 
     save_path = os.path.join(save_dir, f"{task}_epoch{e+1}.pt")
@@ -227,3 +233,40 @@ for e in range(epoch):
 # sampling example
 dit.eval()
 
+dit_wrapper = WrappedModel(dit)
+scheduler = PolynomialConvexScheduler(n=2.0)
+path = MixtureDiscreteProbPath(scheduler=scheduler)
+mask_id = sp.piece_to_id("[MASK]")
+pad_id = sp.pad_id() if sp.pad_id() != -1 else 0
+
+with torch.no_grad():
+    for batch in loader:
+        text_embeddings = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["input_masks"]
+            ).last_hidden_state.to(device)  # B x T x H
+        lengths, length_logits = length_predictor(
+            x=text_embeddings.transpose(0,1),  # T x B x H
+            encoder_padding_mask=~batch["input_masks"].to(device).bool()  # B x T (True = pad)
+        )
+        # masks from predicted length
+        predicted_lengths = lengths.argmax(dim=1) + 1 # B,
+        B = predicted_lengths.shape[0]
+        T = predicted_lengths.max().item()
+        masks = torch.arange(T).unsqueeze(0).repeat(B,1).to(device) < predicted_lengths.unsqueeze(-1) # B x T
+        
+        samples = sample(
+            model_wrapper=dit_wrapper,
+            text_embeddings=text_embeddings,
+            embedding_masks=masks,
+            predited_lengths=predicted_lengths,
+            vocab_size=vocab_size,
+            mask_id=mask_id,
+            pad_id=pad_id,
+            path=path,
+            steps=10,
+        )
+        print("samples:", samples)
+        break
+    
+        
