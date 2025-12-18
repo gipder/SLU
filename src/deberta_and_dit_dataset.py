@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModel
 from my_dataset import Seq2SeqCollator, Seq2SeqDataset
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset, Sampler
 import sentencepiece as spm
 
 class DeBERTaAndDiTDataset(Dataset):
@@ -84,7 +84,7 @@ class DeBERTaAndDiTDataset(Dataset):
             'target_ids': self.target_ids[idx],  # Shape: (L_tgt,)
             'input_texts': self.input_texts[idx],
             'target_texts': self.target_texts[idx],
-            'inputs': self.inputs[idx],          # Tokenizer output dict
+            #'inputs': self.inputs[idx],          # Tokenizer output dict
         }
 
 
@@ -95,16 +95,39 @@ class DeBERTaAndDiTCollator:
 
     def __call__(self, batch):
         # batch: List of dicts with 'input' and 'target' tensors
-        input_seqs = [item['input_ids'] for item in batch]
-        target_seqs = [item['target_ids'] for item in batch]
+        input_seqs = []
+        target_seqs = []
+        input_lens = []
+        target_lens = []
 
+        for item in batch:
+            i_seq = item['input_ids']
+            t_seq = item['target_ids']
+
+            input_seqs.append(i_seq)
+            target_seqs.append(t_seq)
+
+            input_lens.append(i_seq.size(0))
+            target_lens.append(t_seq.size(0))
+        
         # Pad sequences
         input_padded = nn.utils.rnn.pad_sequence(input_seqs, batch_first=True, padding_value=self.pad_id)
         target_padded = nn.utils.rnn.pad_sequence(target_seqs, batch_first=True, padding_value=self.pad_id)
 
         # Create attention masks
-        input_mask = (input_padded != self.pad_id).long()
-        target_mask = (target_padded != self.pad_id).long()
+        #input_mask = (input_padded != self.pad_id).long()
+        #target_mask = (target_padded != self.pad_id).long()
+                
+        max_input_len = input_padded.shape[1]
+        max_target_len = target_padded.shape[1]
+        
+        input_lens_tensor = torch.tensor(input_lens)
+        target_lens_tensor = torch.tensor(target_lens)
+
+        # Broadcasting을 이용한 고속 마스크 생성
+        # [0, 1, 2, ...] < [[5], [3], ...] 형태로 비교
+        input_mask = (torch.arange(max_input_len) < input_lens_tensor.unsqueeze(1)).long()
+        target_mask = (torch.arange(max_target_len) < target_lens_tensor.unsqueeze(1)).long()
 
         return {
             'input_ids': input_padded,
@@ -112,3 +135,25 @@ class DeBERTaAndDiTCollator:
             'target_ids': target_padded,
             'target_masks': target_mask
         }
+    
+class LengthGroupedSampler(Sampler):
+    def __init__(self, dataset: DeBERTaAndDiTDataset, batch_size: int, drop_last: bool = False):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+
+        # 길이에 따른 인덱스 그룹화
+        self.length_buckets = {}
+        for idx, target_ids in enumerate(self.dataset.target_ids):
+            length = target_ids.size(0)
+            if length not in self.length_buckets:
+                self.length_buckets[length] = []
+            self.length_buckets[length].append(idx)
+
+        # 각 길이 그룹에서 배치 생성
+        self.batches = []
+        for length, indices in self.length_buckets.items():
+            for i in range(0, len(indices), batch_size):
+                batch_indices = indices[i:i + batch_size]
+                if len(batch_indices) == batch_size or not drop_last:
+                    self.batches.append(batch_indices)
