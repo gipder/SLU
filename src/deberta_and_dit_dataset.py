@@ -22,8 +22,8 @@ class DeBERTaAndDiTDataset(Dataset):
         self.out_tokenizer = out_tokenizer
         self.max_len = max_len
         # TODO: future work
-        # self.add_bos = add_bos
-        # self.add_eos = add_eos
+        self.add_bos = add_bos
+        self.add_eos = add_eos
 
         assert self.in_tokenizer is not None, "Input tokenizer must be provided."
         assert self.out_tokenizer is not None, "Output tokenizer must be provided."
@@ -34,6 +34,7 @@ class DeBERTaAndDiTDataset(Dataset):
         self.target_ids = []
         self.input_texts = []
         self.target_texts = []
+        self.inputs = []
 
         with open(self.input_files, encoding="utf-8") as fin, \
             open(self.target_files, encoding="utf-8") as ftgt:
@@ -46,12 +47,15 @@ class DeBERTaAndDiTDataset(Dataset):
 
                 self.input_texts.append(src_line)
                 self.target_texts.append(tgt_line)
-
-                self.input_ids.append(self.encode_input(src_line))
+                
+                encoded_ids, encoded_all = self.encode_input(src_line)                
+                self.input_ids.append(encoded_ids)
+                self.inputs.append(encoded_all)
                 self.target_ids.append(self.encode_target(tgt_line))
 
         assert len(self.input_ids) == len(self.target_ids), "Input and target size mismatch."
         assert len(self.input_texts) == len(self.target_texts), "Input and target text size mismatch."
+        assert len(self.input_ids) == len(self.inputs), "Input ids and inputs size mismatch."
     
     def encode_input(self, text: str):
         encoded = self.in_tokenizer(
@@ -61,10 +65,14 @@ class DeBERTaAndDiTDataset(Dataset):
             add_special_tokens=True,
             return_tensors="pt"
         )        
-        return encoded['input_ids'].squeeze(0)
+        return encoded['input_ids'].squeeze(0), encoded
     
     def encode_target(self, text: str):
         encoded = self.out_tokenizer.encode(text, out_type=int)
+        if self.add_bos and self.out_tokenizer.bos_id() != -1:
+            encoded = [self.out_tokenizer.bos_id()] + encoded
+        if self.add_eos and self.out_tokenizer.eos_id() != -1:
+            encoded = encoded + [self.out_tokenizer.eos_id()]
         return torch.tensor(encoded, dtype=torch.long)
     
     def __len__(self):
@@ -76,17 +84,14 @@ class DeBERTaAndDiTDataset(Dataset):
             'target_ids': self.target_ids[idx],  # Shape: (L_tgt,)
             'input_texts': self.input_texts[idx],
             'target_texts': self.target_texts[idx],
+            'inputs': self.inputs[idx],          # Tokenizer output dict
         }
 
 
 class DeBERTaAndDiTCollator:
     def __init__(self,
-                 pad_id: int,
-                 in_tokenizer=None,
-                 out_tokenizer=None):
+                 pad_id: int):
         self.pad_id = pad_id
-        self.in_tokenizer = in_tokenizer
-        self.out_tokenizer = out_tokenizer
 
     def __call__(self, batch):
         # batch: List of dicts with 'input' and 'target' tensors
