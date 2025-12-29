@@ -9,6 +9,7 @@ def make_bpe_model(
         mask_token: str='[MASK]',
         pad_token: str='[PAD]',
         null_token: str='▁',
+        blank_token: str='<blk>',
         ) -> spm.SentencePieceProcessor:
     """
     Make BPE model for STOP dataset.
@@ -26,6 +27,7 @@ def make_bpe_model(
     MASK = mask_token
     PAD = pad_token # not using now
     NULL_SPACE = null_token
+    BLANK = blank_token
     
     files = glob.glob(f"{SRC_DIR}/low.*.asr") + glob.glob(f"{SRC_DIR}/low.*.slu")
     input_str = ",".join(files)
@@ -42,11 +44,11 @@ def make_bpe_model(
         vocab_size=NUM_BPE,
         model_type="bpe",
         character_coverage=1.0,
-        control_symbols=[MASK],
-        unk_id=1,
-        bos_id=2,
-        eos_id=3,
-        pad_id=4,
+        control_symbols=[BLANK, MASK],
+        pad_id=2,
+        unk_id=3,
+        bos_id=4,
+        eos_id=5,        
         user_defined_symbols=tags,
     )
 
@@ -58,8 +60,7 @@ def make_bpe_model(
     return sp
 
 
-if __name__ == "__main__":
-    
+if __name__ == "__main__":    
     STOP_DIR="./data/STOP_text"
     sp = make_bpe_model(
         src_dir=STOP_DIR,

@@ -2,16 +2,17 @@ import torch
 import torch.nn as nn
 from typing import Optional
 from transformers import AutoModel
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict
 
 @dataclass
 class SLUConfig:
     llm_name: str = "microsoft/deberta-v3-base"
-    upsampler_factor: int = 8
+    upsample_factor: int = 8
     d_model: int = 768
     dropout: float = 0.1
     use_log_probs: bool = True
     blank_token_id: int = 0
+    vocab_size: int = 650
     
 class SLUModel(nn.Module):
     def __init__(self,
@@ -32,7 +33,7 @@ class SLUModel(nn.Module):
         self.config = config        
         self.text_model_name = self.config.llm_name
         self.text_encoder = AutoModel.from_pretrained(self.text_model_name)
-        self.components = nn.ModuleDict(components)
+        self.components = nn.ModuleDict(components)        
         #self.upsampler = upsampler
         #self.decoder = decoder
         self._freeze_text_encoder()
@@ -50,15 +51,19 @@ class SLUModel(nn.Module):
             param.requires_grad = False
         print(f"[{self.text_model_name}] parameters are frozen.")
 
-    def forward(self, input_ids, input_masks, target_ids, target_masks):
-        # Encode input text
-        device = self.device if self.device is not None else input_ids.device
+    def forward(self, input_ids, input_masks, target_ids, target_masks,
+                device: Optional[torch.device]=None):
+        # Encode input text        
+        if device is None:
+            device = input_ids.device
         with torch.inference_mode():
             text_embeddings = self.text_encoder(
                 input_ids=input_ids,
                 attention_mask=input_masks
             ).last_hidden_state.to(device)
-
+        
+        text_embeddings = text_embeddings.clone()
+        # Upsample text embeddings if upsampler is provided
         if "upsampler" in self.components:
             upsampled_embeddings, upsampled_masks = self.upsampler(
                 text_embeddings,
@@ -66,11 +71,11 @@ class SLUModel(nn.Module):
             
         text_embeddings = upsampled_embeddings
         input_masks = upsampled_masks
-
-        B, T, D = text_embeddings.size()        
-        input_lengths = input_masks.sum(dim=1).long()
+        
+        # B, T, D = text_embeddings.size()        
+        input_lengths = input_masks.sum(dim=1).long()        
         target_lengths = target_masks.sum(dim=1).long()
-
+        
         ret = {}
         with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
             logits = self.proj(text_embeddings)            
@@ -81,24 +86,20 @@ class SLUModel(nn.Module):
             loss = self.loss(log_probs, target_ids, input_lengths, target_lengths)
             ret['loss'] = loss
 
-        return ret
-       
+        return ret       
 
-    def save_checkpoint(self, path: str):
-        
-        torch.save(self.state_dict(), path)
-        print(f"Model checkpoint saved at {path}")
+    def save_checkpoint(self, path: str, optimizer=None, step=0):        
+        state_dict = {k: v for k, v in self.state_dict().items() if "text_encoder" not in k}
+        torch.save({
+            "config": asdict(self.config),
+            "component_keys": list(self.components.keys()),
+            "model_state_dict": state_dict,
+            "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
+            "step": step
+        }, path)
 
 
-    def forward(self, input_ids, attention_mask):
-        # Base model forward
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state  # B x T_src x D
-
-        # Upsample
-        upsampled_states = self.upsample(hidden_states)  # B x (T_src * upsample_factor) x D
-
-        # Project to vocab size
-        logits = self.proj(upsampled_states)  # B x T_tgt x Vocab_size
-
-        return logits
+if __name__ == "__main__":
+    config = SLUConfig()
+    model = SLUModel(config)
+    print(model)
