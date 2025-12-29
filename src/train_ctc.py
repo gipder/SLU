@@ -22,20 +22,44 @@ from model_wrapper import WrappedModel
 # For DFM sampmling
 from sampling import sample
 
+class ConvUpsample(nn.Module):
+    def __init__(self, d_model, upsample_factor):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            d_model,
+            d_model,
+            kernel_size=upsample_factor,
+            stride=1,
+            padding=upsample_factor // 2,
+            groups=d_model,   # depthwise
+        )
+
+    def forward(self, x):
+        # x: B x T x D
+        x = x.transpose(1, 2)        # B x D x T
+        x = self.conv(x)             # B x D x T
+        x = x.repeat_interleave(upsample_factor, dim=-1)
+        return x.transpose(1, 2)     # B x (T*upsample) x D
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # 1. LLM 모델과 토크나이저 로드 (microsoft/deberta-base 사용)
 model_name = "microsoft/deberta-v3-base"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModel.from_pretrained(model_name)
+model = AutoModel.from_pretrained(model_name).to(device)
 
 # output tokenizer
 sp = spm.SentencePieceProcessor()
 sp.load("data/STOP_text/bpe_650.model")
 
+blank = "<blk>"
 in_tokenizer = tokenizer
 out_tokenizer = sp
-pad_id = out_tokenizer.pad_id() if out_tokenizer.pad_id() != -1 else 0
+pad_id = out_tokenizer.pad_id()
 mask_id = out_tokenizer.piece_to_id("[MASK]")
-print(f"{pad_id=}, {mask_id=}")
+blank_id = out_tokenizer.piece_to_id("<blk>")
+
+print(f"{blank_id=}, {mask_id=}, {pad_id=}")
 
 # Dataset
 dataset = DeBERTaAndDiTDataset(
@@ -50,21 +74,30 @@ collator = DeBERTaAndDiTCollator(pad_id=dataset.pad_id)
 
 vocab_size = out_tokenizer.get_piece_size()
 print(f"{vocab_size=}")
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"{out_tokenizer.piece_to_id('<blk>')=}")
 
 d_model = 768
+upsample_factor = 8
 proj = nn.Sequential(
-    torch.nn.Linear(d_model, d_model),    
-    torch.nn.Linear(d_model, vocab_size)
+    nn.Linear(d_model, d_model),
+    nn.GELU(),
+    nn.LayerNorm(d_model),    
+    nn.Linear(d_model, vocab_size)
 ).to(device)
 
+upsample = ConvUpsample(d_model, upsample_factor).to(device)
+
 # loss function
-loss_ctc = nn.CTCLoss(blank=0, zero_infinity=True)
+loss_ctc = nn.CTCLoss(blank=blank_id, zero_infinity=True)
 
 # configure optimizer
-lr = 1e-4
-optim = torch.optim.AdamW(proj.parameters(), lr=lr)
+lr = 1e-3
+optim = torch.optim.AdamW(list(proj.parameters()) + list(upsample.parameters()),
+                          lr=lr,
+                          weight_decay=1e-4)
+
+scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+
 epoch = 100
 batch_size = 256
 save_step = 2000
@@ -87,6 +120,9 @@ loader = DataLoader(
 proj_params = sum(p.numel() for p in proj.parameters() if p.requires_grad)
 print(f"Total trainable parameters in the projection: {proj_params:,}")
 
+# encoder is freezed
+model.eval()
+
 # training loop
 step = 0
 for e in range(epoch):
@@ -99,35 +135,44 @@ for e in range(epoch):
         #print("Target Ids:", batch["target_ids"]) # 첫 번째 샘플 마스크 확인
 
         # running encoder
-        with torch.no_grad():
+        with torch.inference_mode():
             text_embeddings = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["input_masks"]
+                input_ids=batch["input_ids"].to(device),
+                attention_mask=batch["input_masks"].to(device)
             ).last_hidden_state.to(device)  # B x T x H
 
         B, T, D = text_embeddings.shape
-        upsample_factor = 8
+        
         text_embeddings = text_embeddings.unsqueeze(2).repeat(1, 1, upsample_factor, 1)
         text_embeddings = text_embeddings.reshape(B, T * upsample_factor, D)
-        logits = proj(text_embeddings)                
+        text_embeddings = upsample(text_embeddings)
+        
         targets = batch["target_ids"].to(device).long()  # B x T
         masks = batch["target_masks"].to(device)  # B x T mask
         target_lengths = masks.sum(dim=-1).long() # B,
-
-        log_probs = logits.log_softmax(dim=-1)
-        log_probs = log_probs.transpose(0, 1)
+        
         input_lengths = batch["input_masks"].sum(dim=-1).long() * upsample_factor
         input_lengths = input_lengths.to(device)
+
         bad = (target_lengths > input_lengths)
         if bad.any():
             print("CTC impossible samples:", bad.nonzero().squeeze(-1)[:20])
             print("input_lengths:", input_lengths[bad][:20])
             print("target_lengths:", target_lengths[bad][:20])
 
-        loss = loss_ctc(log_probs, targets, input_lengths, target_lengths)
+        with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+            logits = proj(text_embeddings)                
+            log_probs = logits.log_softmax(dim=-1)
+            log_probs = log_probs.transpose(0, 1)
 
-        loss.backward()
-        optim.step()
+            loss = loss_ctc(log_probs, targets, input_lengths, target_lengths)
+
+        scaler.scale(loss).backward()
+        nn.utils.clip_grad_norm_(proj.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(upsample.parameters(), 1.0)
+        scaler.step(optim)
+        scaler.update()        
+        
         if step % 10 == 0:
             print(f"Step {step}, Loss: {loss.item()}")
         """
