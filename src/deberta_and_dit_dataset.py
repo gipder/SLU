@@ -69,10 +69,10 @@ class DeBERTaAndDiTDataset(Dataset):
     
     def encode_target(self, text: str):
         encoded = self.out_tokenizer.encode(text, out_type=int)
-        if self.add_bos and self.out_tokenizer.bos_id() != -1:
-            encoded = [self.out_tokenizer.bos_id()] + encoded
-        if self.add_eos and self.out_tokenizer.eos_id() != -1:
-            encoded = encoded + [self.out_tokenizer.eos_id()]
+        #if self.add_bos and self.out_tokenizer.bos_id() != -1:
+        #    encoded = [self.out_tokenizer.bos_id()] + encoded
+        #if self.add_eos and self.out_tokenizer.eos_id() != -1:
+        #    encoded = encoded + [self.out_tokenizer.eos_id()]
         return torch.tensor(encoded, dtype=torch.long)
     
     def __len__(self):
