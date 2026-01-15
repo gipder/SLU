@@ -84,3 +84,4 @@ def make_gif_from_xts(
         return out_path
 
     raise ValueError("mode must be 'animate' or 'stack'")
+

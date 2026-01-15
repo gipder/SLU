@@ -1,6 +1,18 @@
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
+from dataclasses import dataclass
+
+@dataclass
+class TextAudioFuseConfig:
+    d_model: int
+    n_heads: int = 8
+    d_ff: int = 2048
+    d_out: int = 512
+    n_layers: int = 2
+    dropout: float = 0.1
+    pool: str = "mean"  # "mean" or "cls"
+    is_proj: bool = False
 
 class TextAudioFusePool(nn.Module):
     """
@@ -10,8 +22,8 @@ class TextAudioFusePool(nn.Module):
     emb_out   = Transformer(emb_fused)            # self-attn encoder
     emb_pool  = masked_mean_pool(emb_out, text_mask)
     """
-    def __init__(
-        self,
+    def __init__(self, cfg: TextAudioFuseConfig):
+        """
         d_model: int,
         n_heads: int = 8,
         d_ff: int = 2048,
@@ -20,48 +32,55 @@ class TextAudioFusePool(nn.Module):
         dropout: float = 0.1,
         pool: str = "mean",  # "mean" or "cls"
         is_proj: bool = False
-    ):
+        ):
+        """
         super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        assert pool in ("mean", "cls")
+        self.cfg = cfg
+        assert cfg.d_model % cfg.n_heads == 0, "d_model must be divisible by n_heads"
+        assert cfg.pool in ("mean", "cls")
 
-        self.d_model = d_model
-        self.pool = pool
+        self.d_model = cfg.d_model
+        self.n_heads = cfg.n_heads
+        self.d_ff = cfg.d_ff
+        self.d_out = cfg.d_out
+        self.n_layers = cfg.n_layers
+        self.dropout = cfg.dropout
+        self.pool = cfg.pool
+        self.is_proj = cfg.is_proj
 
         # cross-attention: Q=text, K/V=audio
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            dropout=dropout,
+            embed_dim=self.d_model,
+            num_heads=self.n_heads,
+            dropout=self.dropout,
             batch_first=True,  # (B, T, D)
         )
 
         # Stack(concat) then Linear
         self.fuse = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
-            nn.Dropout(dropout),
+            nn.Linear(2 * self.d_model, self.d_model),
+            nn.Dropout(self.dropout),
         )
 
         # Transformer over fused text-length sequence
         enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_ff,
-            dropout=dropout,
+            d_model=self.d_model,
+            nhead=self.n_heads,
+            dim_feedforward=self.d_ff,
+            dropout=self.dropout,
             batch_first=True,
             activation="gelu",
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=self.n_layers)
 
         # optional CLS pooling
-        if pool == "cls":
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        if self.pool == "cls":
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
             nn.init.normal_(self.cls_token, std=0.02)
         
-        # output projection
-        self.is_proj = is_proj
-        self.proj = nn.Linear(d_model, d_out)
+        # output projection        
+        self.proj = nn.Linear(self.d_model, self.d_out)
 
     @staticmethod
     def _to_key_padding_mask(valid_mask: torch.Tensor) -> torch.Tensor:
@@ -169,7 +188,8 @@ if __name__ == "__main__":
     text_mask = torch.tensor([[1,1,1,0,0],[1,1,1,1,1]]).bool().to('cuda')
     audio_mask = torch.tensor([[1,1,1,1,0,0,0],[1,1,1,1,1,1,0]]).bool().to('cuda')
 
-    model = TextAudioFusePool(d_model=D, n_heads=8, n_layers=2, pool="mean")
+    config = TextAudioFuseConfig(d_model=D, n_heads=8, n_layers=2, pool="mean")
+    model = TextAudioFusePool(config)
     model = model.to('cuda')
     emb_pool, emb_seq, attn_w = model(emb_text, text_mask, emb_audio, audio_mask, need_attn_weights=True)
 

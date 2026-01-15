@@ -14,7 +14,10 @@ class HuBERTandDeBERTaDataset(Dataset):
                  task="eval",
                  feat_dir="./hubert_deberta_cache",                 
                  bpe_file="./bpe_model/bpe_650.model",
-                 K=650):
+                 K=650,
+                 fixed_length=16,
+                 debugging=False,
+                 debugging_num=128,):
         self.task = task
 
         # Resolution K subwords
@@ -22,28 +25,48 @@ class HuBERTandDeBERTaDataset(Dataset):
         self.file_paths = glob.glob(os.path.join(feat_dir, f"{task}*", "**", "*.pt"))
         self.metadatas = []
         self.sp = spm.SentencePieceProcessor()
-        max_audio_length = 0
-        max_text_length = 0
+        # loading sentence piece model
+        self.sp.Load(bpe_file)
+        self.max_output_length = 0        
+
+        self.max_audio_length = 0
+        self.max_text_length = 0
+
+        self.fixed_length = fixed_length
+        self.debugging = debugging
+        self.debugging_num = debugging_num
+
+        idx = 0
         for file in tqdm(self.file_paths):
             data = torch.load(file, map_location="cpu")
             path = file
             audio_length = data["feat_mask"].sum().item()
             text_length = data["text_feat_mask"].sum().item()
-            if max_audio_length < audio_length: 
-                max_audio_length = audio_length
-            if max_text_length < text_length:
-                max_text_length = text_length
+            slu = data["decoupled_normalized_seqlogical"]
+            slu_length = len(self.sp.encode(slu))
+
+            if self.max_audio_length < audio_length: 
+                self.max_audio_length = audio_length
+            if self.max_text_length < text_length:
+                self.max_text_length = text_length
+            if self.max_output_length < slu_length:
+                self.max_output_length = slu_length
             metadata = {"path": path,
                         "audio_length": audio_length,
-                        "text_length": text_length}
+                        "text_length": text_length,
+                        "slu_length": slu_length}            
         
             self.metadatas.append(metadata)  
+            idx += 1
+            if self.debugging and idx >= self.debugging_num:
+                break
+        
+        print(f"{self.max_audio_length=}")
+        print(f"{self.max_text_length=}")
+        print(f"{self.max_output_length=}")
 
         # sort by length
-        self.metadatas.sort(key=lambda x: x["audio_length"])
-        
-        # loading sentence piece model
-        self.sp.Load(bpe_file)
+        self.metadatas.sort(key=lambda x: x["audio_length"])                        
 
     def __len__(self):
         return len(self.metadatas)
@@ -61,9 +84,15 @@ class HuBERTandDeBERTaDataset(Dataset):
         gts = data["ground_truth"]
         hyps = data["hypothesis"]
         slus = data["decoupled_normalized_seqlogical"]
-        # text -> tensor
-        slus = torch.tensor(self.sp.encode(slus)).long()
-        slu_mask = torch.ones_like(slus).long()
+        # text -> tensor                
+        
+        slus = torch.tensor(self.sp.encode(slus)).long()        
+        slus_length = slus.size(0)        
+        # fix the length of tensor to handle it in Unet
+        slus_fixed = torch.zeros((self.fixed_length)).long()
+        slus_fixed[:slus_length] = slus
+        slus = slus_fixed
+        slu_mask = torch.ones_like(slus).long()        
         return (
             feats, feat_mask,
             text_feats, text_feat_mask, 
@@ -112,8 +141,8 @@ def my_collate_fn(batch):
     text_feats_padded = pad_sequence(text_feats, batch_first=True) # (B, T, D)
     text_feat_mask_padded = pad_sequence(text_feat_mask, batch_first=True) # (B, T)
     slus_padded = pad_sequence(slus, batch_first=True) # (B, T')
-    slu_mask_padded = pad_sequence(slu_mask, batch_first=True) # (B, T')
-
+    slu_mask_padded = pad_sequence(slu_mask, batch_first=True) # (B, T')    
+    
     return (
         feats_padded, feat_mask_padded,
         text_feats_padded, text_feat_mask_padded,
