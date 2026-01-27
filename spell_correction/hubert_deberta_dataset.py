@@ -91,9 +91,9 @@ class HuBERTandDeBERTaDataset(Dataset):
         text_mask = data["text_feat_mask"].long()    
         str_gts = data["ground_truth"]
         str_hyps = data["greedy_hypothesis"]
-        
+                
         gts_encoded = self.tokenizer.encode(str_gts)
-        hyps_encoded = self.tokenizer.encode(str_hyps)
+        hyps_encoded = self.tokenizer.encode(str_hyps)        
         gts = torch.tensor(gts_encoded).long()
         hyps = torch.tensor(hyps_encoded).long()
         #make mask
