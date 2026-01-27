@@ -54,6 +54,7 @@ def build_parser():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--alpha", type=float, default=0.1,
                    help="weight for length prediction loss")
+    p.add_argument("--ckpt_path", type=str, default=None, help="Path to load checkpoint")
 
     # ---- model dims / arch ----
     ## for DiT model
@@ -96,10 +97,13 @@ def train_dfm(
     args: ArgumentParser,
     dfm_model,    
     train_loader,
-    eval_loader,    
+    eval_loader,
+    optim,
+    optim_scheduler,    
     grad_clip: float = 1.0,
     use_amp: bool = True,
     mask_id = 1,
+    init_step: int = 0,
     debugging: bool = False
 ):
     if args.save_dir is None:
@@ -112,32 +116,10 @@ def train_dfm(
         os.makedirs(save_dir, exist_ok=True)
 
     #sp = train_loader.dataset.sp
-
-    def lr_lambda(current_step):
-        if current_step < args.warmup_step:
-            return float(current_step) / float(max(1, args.warmup_step))
-        
-        progress = (
-            float(current_step - args.warmup_step) / 
-            float(max(1, args.total_step - args.warmup_step))
-        )
-
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-    optim = torch.optim.AdamW(
-        list(dfm_model.parameters()),
-        lr=args.lr,        
-        weight_decay=args.weight_decay)
-    
-    optim_scheduler = LambdaLR(optim, lr_lambda)
-    scaler = GradScaler(enabled=(use_amp and device.startswith("cuda")))
-
     # a convex path path
     scheduler = PolynomialConvexScheduler(n=2.0)
     path = MixtureDiscreteProbPath(scheduler=scheduler)
 
-    #audio_criterion = nn.CrossEntropyLoss(reduction="mean")
-    #text_criterion = nn.CrossEntropyLoss(reduction="mean")
     length_criterion = nn.CrossEntropyLoss(reduction="mean")
     if args.loss_type == "ce":
         criterion = nn.CrossEntropyLoss(reduction="none")
@@ -153,7 +135,7 @@ def train_dfm(
     ema_beta = getattr(args, "loss_ema_beta", 0.98)
     
     train_iter = iter(train_loader)    
-    for step in range(args.total_step):
+    for step in range(init_step, args.total_step):
         # train mode
         dfm_model.train()
         try:
@@ -348,8 +330,42 @@ if __name__ == "__main__":
     )        
     print(f"* DFMConfig: ")
     print(json.dumps(asdict(cfg), indent=2))
-
+    
     dfm_model = DFMModel(cfg, device=device)
+
+    if args.ckpt_path is not None:        
+        checkpoint = torch.load(args.ckpt_path, map_location=device)
+        dfm_model.load_state_dict(checkpoint["dfm_model"])
+        
+        print(f"* Loaded checkpoint from {args.ckpt_path}")
+
+    optim = torch.optim.AdamW(
+        list(dfm_model.parameters()),
+        lr=args.lr,        
+        weight_decay=args.weight_decay
+    )
+
+    def lr_lambda(current_step):
+        if current_step < args.warmup_step:
+            return float(current_step) / float(max(1, args.warmup_step))
+        
+        progress = (
+            float(current_step - args.warmup_step) / 
+            float(max(1, args.total_step - args.warmup_step))
+        )
+
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    optim_scheduler = LambdaLR(optim, lr_lambda)    
+    scaler = GradScaler(enabled=(device.startswith("cuda")))
+    init_step = 0
+
+    if args.ckpt_path is not None:
+        optim.load_state_dict(checkpoint["optim"])
+        scaler.load_state_dict(checkpoint["scaler"])
+        init_step = checkpoint["step"] + 1
+        print(f"* Loaded optimizer and scaler states from {args.ckpt_path}, "
+               "resuming from step {init_step}")
 
     trainable_params = 0
     for model in [dfm_model.dit, dfm_model.length_predictor]:
@@ -410,11 +426,15 @@ if __name__ == "__main__":
 
     mask_id = tokenizer.convert_tokens_to_ids(args.mask_token)
     print(f"* {args.mask_token}의 ID: {mask_id}")
+
     train_dfm(
         args=args,
         dfm_model=dfm_model,
         train_loader=train_dl,
         eval_loader=eval_dl,
+        optim=optim,
+        optim_scheduler=optim_scheduler,
         mask_id=mask_id,
-        debugging=args.debugging,
+        init_step=init_step,
+        debugging=args.debugging,        
     )

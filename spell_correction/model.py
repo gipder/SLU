@@ -29,11 +29,18 @@ class DFMModelWrapper(ModelWrapper):
         super().__init__(model)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, **extras) -> torch.Tensor:
-        emb_seq = extras["emb_seq"]
-        emb_mask = extras["emb_mask"]
-        logits = self.model(x, t, emb_seq, emb_mask) # B, T_out, K
+        audio_feats = extras["audio_feats"]
+        audio_mask = extras["audio_mask"]
+        text_feats = extras["text_feats"]
+        text_mask = extras["text_mask"]        
+        logits, _ = self.model(x, t, audio_feats, audio_mask, text_feats, text_mask) # B, T_out, K
         prob = torch.nn.functional.softmax(logits.float(), dim=-1)
         return prob
+    
+    def get_length_logits(self, x: torch.Tensor, x_mask: torch.Tensor) -> torch.Tensor:
+        length_logits = self.model.length_predictor(x, ~(x_mask.bool()))
+        #print(f"{length_logits.argmax(dim=-1)=}")
+        return length_logits        
 
 
 class DFMModel(nn.Module):
@@ -57,7 +64,7 @@ class DFMModel(nn.Module):
         )
 
         if self.device is not None:
-            self.to(self.device)
+            self.to(self.device)        
 
     def forward(
         self,
@@ -131,5 +138,10 @@ if __name__ == "__main__":
     print(f"input text: {text_feats.shape}")
     print(f"logits: {logits.shape}")
     print(f"length_logits: {length_logits.shape}")
+
+    # test model wrapper
+    wrapper = DFMModelWrapper(model)
+    pred_lengths = wrapper.get_length_logits(text_feats, text_mask)
+    print(f"pred_lengths: {pred_lengths.shape}")
 
 
