@@ -3,6 +3,7 @@ from torch.utils.data import DataLoader
 import torch.nn as nn
 from typing import Optional
 from tqdm import tqdm
+import logging
 
 # For DFML
 from flow_matching.path import MixtureDiscreteProbPath
@@ -12,6 +13,9 @@ from flow_matching.utils import ModelWrapper
 from flow_matching.loss import MixturePathGeneralizedKL
 from flow_matching.solver import MixtureDiscreteEulerSolver
 
+
+logger = logging.getLogger("__name__")
+
 def sampling(
     model: ModelWrapper,                
     audio_feats: torch.Tensor,
@@ -20,7 +24,8 @@ def sampling(
     text_mask: torch.Tensor,        
     n_step: int,
     K: int,    
-    mask_id: int,        
+    mask_id: int, 
+    max_output_length: Optional[int] = 256,       
     return_intermediates: Optional[bool] = True,
     is_uniform: Optional[bool] = False,
     step_size: Optional[float] = 0.01,
@@ -83,12 +88,7 @@ def sampling(
     time_grid = torch.linspace(0.0, 1.0 - eps, n_step, device=device)
 
     B = audio_feats.size(0) 
-    if oracle_lengths is not None:
-        T = oracle_lengths.max().item()
-    else:   
-        # normal case: predict lengths
-        pred_lengths = model.get_length_logits(text_feats, text_mask.bool())
-        T = torch.argmax(pred_lengths, dim=-1).max().item()    
+    T = max_output_length    
 
     if is_uniform:
         x_0 = torch.randint(0, K, (B, T), device=device)
@@ -114,14 +114,15 @@ def sampling_batch(
     model: ModelWrapper,    
     n_step: int,
     K: int,    
-    mask_id: int,        
+    mask_id: int,     
+    max_output_length: Optional[int] = 256,   
     return_intermediates: Optional[bool] = True,
     is_uniform: Optional[bool] = False,
     step_size: Optional[float] = 0.01,
     eps: Optional[float] = 1e-4,
     device: Optional[torch.DeviceObjType] = "cuda",
     verbose: Optional[bool] = False,
-    use_oracle_length: Optional[bool] = False,
+    debugging: Optional[bool] = False,
 ):
     """
     Docstring for sampling_batch
@@ -157,28 +158,27 @@ def sampling_batch(
 
     hyp = []
     target = []
+    str_hyps_list = []
+    str_gts_list = []
 
-    if verbose:
-        dataloader = tqdm(test_dl)
-    else:
-        dataloader = test_dl
+    dataloader = test_dl
 
-    for batch in dataloader:
+    step = 0
+    count = 0
+    total_test_data_count = len(test_dl.dataset)    
+    for batch in tqdm(dataloader):
         (
             audio_feats, audio_feat_mask,
             text_feats, text_feat_mask,
-            x_1, x_1_mask 
+            gts, hyps,
+            gt_mask, hyp_mask,
+            str_gts, str_hyps,
         ) = batch
 
         audio_feats = audio_feats.to(device)
         audio_feat_mask = audio_feat_mask.to(device)
         text_feats = text_feats.to(device)
         text_feat_mask = text_feat_mask.to(device)
-        
-        if use_oracle_length:
-            oracle_lengths = x_1_mask.sum(dim=-1)
-        else:
-            oracle_lengths = None
 
         x_1_hat = sampling(
             model=model,  
@@ -189,25 +189,41 @@ def sampling_batch(
             n_step=n_step,
             K=K,            
             mask_id=mask_id,            
+            max_output_length=max_output_length,
             return_intermediates=return_intermediates,
             is_uniform=is_uniform,
             step_size=step_size,
             eps=eps,
             device=device,
-            oracle_lengths=oracle_lengths,            
         )
 
-        if verbose:
-            print(f"{x_1=}")
-            print(f"{x_1_hat[-1]=}")
+        if debugging:
+            logger.info(f"{gts=}")
+            logger.info(f"{x_1_hat[-1]=}")
+            logger.info(f"{gts.shape=}")
+            logger.info(f"{x_1_hat[-1].shape=}")
 
-        target.append(x_1)
-        hyp.append(x_1_hat[-1])        
+        target.append(gts)
+        hyp.append(x_1_hat[-1])
+        str_hyps_list.extend(str_hyps)
+        str_gts_list.extend(str_gts)
+        
+        step += 1
+        count += audio_feats.size(0)
+        if step % 10 == 0:
+            logger.info(f"Evaluation step {step:,}/{len(test_dl):,} completed.")
+            logger.info(f"  Processed {count:,}/{total_test_data_count:,} samples.")            
 
-    final_hyp = torch.cat(hyp, dim=0).tolist()
-    final_target = torch.cat(target, dim=0).tolist()    
+    # 각 batch의 sequence length가 다를 수 있으므로 torch.cat 대신 extend 사용
+    final_hyp = []
+    for batch_hyp in hyp:
+        final_hyp.extend(batch_hyp.tolist())
+    
+    final_target = []
+    for batch_target in target:
+        final_target.extend(batch_target.tolist())
 
-    return final_hyp, final_target
+    return final_hyp, final_target, str_hyps_list, str_gts_list 
 
 def sampling_debugging(
     test_dl: DataLoader,
@@ -215,13 +231,13 @@ def sampling_debugging(
     n_step: int,
     K: int,    
     mask_id: int,
+    max_output_length: Optional[int] = 256,
     return_intermediates: Optional[bool] = True,
     is_uniform: Optional[bool] = False,
     step_size: Optional[float] = 0.01,
     eps: Optional[float] = 1e-4,
     device: Optional[torch.DeviceObjType] = "cuda",    
     verbose: Optional[bool] = False,
-    use_oracle_length: Optional[bool] = False,
 ):
     """
     Docstring for sampling_debugging
@@ -270,13 +286,6 @@ def sampling_debugging(
     
     text_feats = text_feats.to(device)
     text_feat_mask = text_feat_mask.to(device)
-
-    if use_oracle_length:
-        oracle_lengths = gt_mask.sum(dim=-1)
-    else:
-        oracle_lengths = None
-
-    x_1 = gts.to(device)
     
     x_1_hat = sampling(
         model=model,            
@@ -287,12 +296,12 @@ def sampling_debugging(
         n_step=n_step,
         K=K,        
         mask_id=mask_id,            
+        max_output_length=max_output_length,
         return_intermediates=return_intermediates,
         is_uniform=is_uniform,
         step_size=step_size,
         eps=eps,
         device=device, 
-        oracle_lengths=oracle_lengths,           
     )
 
     # S, B, T -> B, S, T

@@ -3,7 +3,63 @@ import numpy as np
 import imageio.v2 as imageio
 from einops import rearrange
 import random
+import argparse
+import logging
+import os
+import time
+from jiwer import process_words, process_characters
 
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logger(save_dir, log_name="train"):
+    """Setup logger that writes to both console and file"""
+    # Root logger를 설정해서 모든 모듈의 logger가 이 핸들러를 사용하도록 함
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+    
+    # Shared formatter for both console and file (파일이름 포함)
+    formatter = logging.Formatter('[%(asctime)s] [%(filename)s:%(lineno)d] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # File handler
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        log_file = os.path.join(save_dir, f"{log_name}-{time.strftime('%Y%m%d-%H%M%S')}.log")
+        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        root_logger.info(f"Logging to {log_file}")
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def remove_module_prefix(state_dict):
+    """Remove 'module.' prefix from state_dict keys (for DataParallel/DDP)"""
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            new_state_dict[k[7:]] = v  # remove 'module.' prefix
+        else:
+            new_state_dict[k] = v
+    return new_state_dict
 
 """
 def make_gif_from_xts(xts, n_plots=10, out_path="out.gif", fps=8):
@@ -118,3 +174,86 @@ def make_gif_from_xts(
 
     raise ValueError("mode must be 'animate' or 'stack'")
 
+
+def compute_wer_cer(hyps_list, targets_list, tokenizer, blank_id, verbose=False):
+    """
+    Compute WER (Word Error Rate) and CER (Character Error Rate) using jiwer.
+    
+    Args:
+        hyps_list: List of hypothesis token ID lists
+        targets_list: List of target token ID lists
+        tokenizer: SentencePiece tokenizer
+        blank_id: ID of blank token
+        verbose: If True, print each hypothesis and reference
+        
+    Returns:
+        Dictionary containing:
+            - wer: Word Error Rate (0-1)
+            - cer: Character Error Rate (0-1)
+            - num_sentences: Total number of sentences
+            - wer_details: Dict with 'hits', 'substitutions', 'deletions', 'insertions'
+            - cer_details: Dict with 'hits', 'substitutions', 'deletions', 'insertions'
+    """
+    hyp_texts = []
+    ref_texts = []
+
+    for hyp_ids, target_ids in zip(hyps_list, targets_list):
+        # Remove blank tokens
+        hyp_ids_cleaned = [id for id in hyp_ids if id != blank_id]
+        target_ids_cleaned = [id for id in target_ids if id != blank_id]
+        
+        # Remove consecutive duplicates (CTC collapse)
+        dedup_hyp_ids = []
+        prev_id = None
+        for id in hyp_ids_cleaned:
+            if id != prev_id:
+                dedup_hyp_ids.append(id)
+                prev_id = id
+        
+        dedup_target_ids = []
+        prev_id = None
+        for id in target_ids_cleaned:
+            if id != prev_id:
+                dedup_target_ids.append(id)
+                prev_id = id
+        
+        # Decode to text
+        # check if tokenizer is SentencePiece or other
+        # SentencePiece tokenizer has decode_ids method
+        if hasattr(tokenizer, 'decode_ids'):
+            hyp_text = tokenizer.decode_ids(dedup_hyp_ids)
+            ref_text = tokenizer.decode_ids(dedup_target_ids)
+        else:
+            hyp_text = tokenizer.decode(dedup_hyp_ids, skip_special_tokens=True)
+            ref_text = tokenizer.decode(dedup_target_ids, skip_special_tokens=True)
+        if verbose:
+            logger.info(f"Hypothesis: {hyp_text}")
+            logger.info(f"Reference:  {ref_text}")
+            logger.info("-----")
+        
+        hyp_texts.append(hyp_text)
+        ref_texts.append(ref_text)
+    
+    # Compute detailed metrics using jiwer.compute_measures
+    word_measures = process_words(ref_texts, hyp_texts)
+    character_measures = process_characters(ref_texts, hyp_texts)    
+    
+    results = {
+        'num_sentences': len(ref_texts),
+        'wer': word_measures.wer,
+        'cer': character_measures.cer,
+        'wer_details': {            
+            'hits': word_measures.hits,
+            'substitutions': word_measures.substitutions,
+            'deletions': word_measures.deletions,
+            'insertions': word_measures.insertions,
+        },
+        'cer_details': {            
+            'hits': character_measures.hits,
+            'substitutions': character_measures.substitutions,
+            'deletions': character_measures.deletions,
+            'insertions': character_measures.insertions,
+        }
+    }
+    
+    return results

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from dit import DiscreteDualDiT
-from length_predictor import MaskedLengthPredictionModule
+#from length_predictor import MaskedLengthPredictionModule
 from flow_matching.utils import ModelWrapper
 
 @dataclass
@@ -16,12 +16,14 @@ class DFMModelConfig:
     num_heads: int = 8
     audio_dim: int = 1024
     text_dim: int = 1024
+    max_output_length: int = 256
+    n_step: int = 4
     # Length Predictor 설정
-    embed_dim: int = audio_dim
-    length_hidden_dim: int = 512
-    max_target_positions: int = 128
-    length_dropout: float = 0.1
-    length_condition: str = "text"  # "audio" or "text"
+    #embed_dim: int = audio_dim
+    #length_hidden_dim: int = 512
+    #max_target_positions: int = 128
+    #length_dropout: float = 0.1
+    #length_condition: str = "text"  # "audio" or "text"
     
 
 class DFMModelWrapper(ModelWrapper):
@@ -33,14 +35,15 @@ class DFMModelWrapper(ModelWrapper):
         audio_mask = extras["audio_mask"]
         text_feats = extras["text_feats"]
         text_mask = extras["text_mask"]        
-        logits, _ = self.model(x, t, audio_feats, audio_mask, text_feats, text_mask) # B, T_out, K
+        logits = self.model(x, t, audio_feats, audio_mask, text_feats, text_mask) # B, T_out, K
         prob = torch.nn.functional.softmax(logits.float(), dim=-1)
         return prob
-    
+    """
     def get_length_logits(self, x: torch.Tensor, x_mask: torch.Tensor) -> torch.Tensor:
         length_logits = self.model.length_predictor(x, ~(x_mask.bool()))
         #print(f"{length_logits.argmax(dim=-1)=}")
         return length_logits        
+    """
 
 
 class DFMModel(nn.Module):
@@ -56,12 +59,14 @@ class DFMModel(nn.Module):
             audio_dim=cfg.audio_dim,
             text_dim=cfg.text_dim
         )
+        """
         self.length_predictor = MaskedLengthPredictionModule(
             embed_dim=cfg.embed_dim,
             length_hidden_dim=cfg.length_hidden_dim,
             max_target_positions=cfg.max_target_positions,
             length_dropout=cfg.length_dropout
         )
+        """
 
         if self.device is not None:
             self.to(self.device)        
@@ -81,6 +86,7 @@ class DFMModel(nn.Module):
         T = x_t.shape[1]
         K = self.cfg.vocab_size
         
+        """
         if self.cfg.length_condition == "text":
             length_logits = self.length_predictor(
                 text_feats, ~(text_mask.bool())
@@ -91,14 +97,14 @@ class DFMModel(nn.Module):
             )
         else:
             raise ValueError(f"Unknown length_condition: {self.cfg.length_condition}")
-
+        """
         logits = self.dit(
             x_t, t,
             audio_feats, text_feats,
             ~(audio_mask.bool()), ~(text_mask.bool())
         )
 
-        return logits, length_logits
+        return logits
 
 
 if __name__ == "__main__":
