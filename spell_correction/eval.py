@@ -263,11 +263,14 @@ def main(args):
         asr_wers.append(results["asr_wer"])
         gt_wers.append(results["gt_wer"])
 
-    for i, task in enumerate(args.test_task):
-        logger.info(f"*** Final Results on {task} set ***")
-        logger.info(f"DFM WER: {dfm_wers[i] * 100:.4f}%")
-        logger.info(f"ASR WER: {asr_wers[i] * 100:.4f}%")
-        logger.info(f"GT WER: {gt_wers[i] * 100:.4f}%")
+    logger.info("=" * 60)
+    logger.info(f"{os.path.basename(args.ckpt_path)} EVALUATION SUMMARY")
+    logger.info("-" * 60)
+    for i, task in enumerate(args.test_task):        
+        logger.info(f"{task} DFM WER: {dfm_wers[i] * 100:.4f}%")
+        logger.info(f"{task} ASR WER: {asr_wers[i] * 100:.4f}%")
+        logger.info(f"{task} GT WER: {gt_wers[i] * 100:.4f}%")
+        logger.info("-" * 60)    
 
     return
 
