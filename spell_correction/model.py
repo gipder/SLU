@@ -47,10 +47,9 @@ class DFMModelWrapper(ModelWrapper):
 
 
 class DFMModel(nn.Module):
-    def __init__(self, cfg: DFMModelConfig, device=None):
+    def __init__(self, cfg: DFMModelConfig):
         super().__init__()
-        self.cfg = cfg
-        self.device = torch.device(device) if device else None
+        self.cfg = cfg        
         self.dit = DiscreteDualDiT(
             vocab_size=cfg.vocab_size,
             hidden_size=cfg.hidden_size,
@@ -67,9 +66,6 @@ class DFMModel(nn.Module):
             length_dropout=cfg.length_dropout
         )
         """
-
-        if self.device is not None:
-            self.to(self.device)        
 
     def forward(
         self,

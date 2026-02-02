@@ -2,7 +2,7 @@ import os
 import sys
 import argparse
 from argparse import ArgumentParser
-from typing import Optional
+from typing import Optional, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -48,27 +48,31 @@ def build_parser():
     p = argparse.ArgumentParser(description="Train DFM (based on U-Net) with HuBERT + DeBERTa features")
 
     # ---- training ----
-    p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--test_batch_size", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=256)    
     p.add_argument("--total_step", type=int, default=800000)
-    p.add_argument("--log_step", type=int, default=500)
+    p.add_argument("--final_epoch", type=int, default=100,)
+    p.add_argument("--log_step", type=int, default=500, help="Logging step interval")
+    p.add_argument("--eval_step", type=int, default=5000, help="Evaluation step interval")
     p.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate by warmup step")
     p.add_argument("--warmup_step", type=int, default=2500)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--save_dir", type=str, default=None, help="If None, auto-generated from lr.")
-    p.add_argument("--save_step", type=int, default=50000)
+    p.add_argument("--reset_save_dir", type=str2bool, default=False, help="Whether to reset save_dir if exists")
+    p.add_argument("--save_step", type=int, default=50000, help="Not using currently")
     p.add_argument("--uniform", type=str2bool, default=False)
     p.add_argument("--loss_type", type=str,
-                   default="ce", choices=["ce", "gkl"], help="ce or gkl(generalized KL)")
-    p.add_argument("--use_additional_loss", type=str2bool, default=False,
-                   help="Whether to use additional loss term")
-    p.add_argument("--use_additional_loss_only", action="store_true", default=False,
-                   help="For comparison, use only additional loss term")
+                   default="ce", choices=["ce", "gkl"], help="ce or gkl(generalized KL)")    
+    #p.add_argument("--use_additional_loss_only", action="store_true", default=False,
+    #               help="For comparison, use only additional loss term")
     p.add_argument("--seed", type=int, default=42)    
     p.add_argument("--ckpt_path", type=str, default=None, help="Path to load checkpoint")
     p.add_argument("--gpu", type=str, default="0", help="GPU ids separated by comma, e.g., '0,1,2'")
     p.add_argument("--use_tar", type=str2bool, default=True, help="Whether to use tarred dataset")
+    # additional loss
+    p.add_argument("--alpha", type=float, default=0.1, help="Weight for additional loss term")    
+    p.add_argument("--use_additional_loss", type=str2bool, default=False,
+                   help="Whether to use additional loss term")
 
     # ---- model dims / arch ----
     ## for DiT model
@@ -79,9 +83,7 @@ def build_parser():
     p.add_argument("--audio_dim", type=int, default=1024)
     p.add_argument("--text_dim", type=int, default=1024)
     p.add_argument("--max_output_length", type=int, default=256, help="Maximum output length during inference")
-    p.add_argument("--n_step", type=int, default=4, help="Number of sampling steps during inference")
-    # additional loss
-    p.add_argument("--alpha", type=float, default=0.1, help="Weight for additional loss term")    
+    p.add_argument("--n_step", type=int, default=5, help="Number of sampling steps during inference")
     ## for length predictor
     #p.add_argument("--embed_dim", type=int, default=1024)
     #p.add_argument("--length_hidden_dim", type=int, default=512)
@@ -96,6 +98,7 @@ def build_parser():
     p.add_argument("--test_task", type=str, default="test")
     p.add_argument("--tokenizer_model_name", type=str, default="facebook/hubert-large-ls960-ft")
     p.add_argument("--mask_token", type=str, default="[MASK]")
+    p.add_argument("--num_samples", type=int, default=2048, help="Number of samples to use for validation")
     #p.add_argument("--shuffle_train", type=bool, default=True)    
 
     # ---- debugging ----
@@ -113,20 +116,150 @@ def build_parser():
 
 
 # -------------------------
+# Validation function
+# -------------------------
+# Validation function
+# -------------------------
+def validate(
+    dfm_model,
+    eval_dataset,
+    tokenizer,
+    args,
+    mask_id,
+    device,
+    num_samples=2048,
+    debugging=False,
+):
+    """
+    Validation 수행 및 메트릭 계산
+    매번 다른 샘플을 무작위로 선택하여 평가
+    
+    Args:
+        dfm_model: 평가할 모델
+        eval_dataset: 전체 evaluation dataset
+        tokenizer: 토크나이저
+        args: 학습 인자
+        mask_id: 마스크 토큰 ID
+        device: 학습 device
+        num_samples: validation에 사용할 샘플 개수 (기본값: 2048)
+        debugging: 디버깅 모드
+    
+    Returns:
+        dict: 'dfm_wer', 'asr_wer', 'gt_wer', 'accuracy' 포함
+    """
+    dfm_model.eval()
+    
+    # 전체 dataset에서 무작위로 num_samples만큼 선택
+    total_samples = len(eval_dataset)
+    num_samples_to_use = min(num_samples, total_samples)
+    
+    if total_samples > num_samples_to_use and debugging is False:
+        random_indices = torch.randperm(total_samples)[:num_samples_to_use]
+        val_dataset = Subset(eval_dataset, random_indices)
+        logger.info(f"* Validation: Sampled {num_samples_to_use:,} from {total_samples:,} samples")
+    else:
+        val_dataset = eval_dataset
+        logger.info(f"* Validation: Using all {total_samples:,} samples")
+    
+    # Validation용 DataLoader 생성
+    val_sampler = BatchSampler(val_dataset,
+                               batch_size=args.batch_size,
+                               shuffle=False)
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_sampler=val_sampler,
+        num_workers=args.num_workers,
+        collate_fn=hubert_and_deberta_dataset_collate_fn,
+    )
+    
+    probability_denoiser = DFMModelWrapper(dfm_model)
+    
+    if debugging:
+        sampling_method = sampling_debugging
+    else:
+        sampling_method = sampling_batch
+
+    with torch.no_grad():
+        hyps, targets, asr_hyps, str_gts = sampling_method(
+            test_dl=val_loader,
+            model=probability_denoiser,
+            n_step=args.n_step,
+            K=args.vocab_size,
+            max_output_length=args.max_output_length,
+            mask_id=mask_id,
+            return_intermediates=True,
+            is_uniform=False,
+            device=device,
+        )
+    
+    # Decode predictions
+    str_hyps = []
+    str_targets = []
+    str_asr_hyps = []
+    str_ground_truths = []
+    correct_predictions = 0
+    
+    assert num_samples_to_use == len(hyps)
+    for b in range(num_samples_to_use):
+        hyp_ids = hyps[b]
+        target_ids = targets[b]
+        str_asr_hyp = asr_hyps[b]
+        str_gt = str_gts[b]
+        
+        hyp = tokenizer.decode(hyp_ids, group_tokens=False)
+        target = tokenizer.decode(target_ids, group_tokens=False)        
+        
+        if args.verbose:
+            logger.info(f"GT: {str_gt.split(' ')}")
+            logger.info(f"TARGET: {target.split(' ')}")
+            logger.info(f"ASR HYP: {str_asr_hyp.split(' ')}")
+            logger.info(f"DFM HYP: {hyp.split(' ')}")
+            logger.info("-----")
+        
+        if hyp == target:
+            correct_predictions += 1
+        
+        str_hyps.append(hyp)
+        str_targets.append(target)
+        str_asr_hyps.append(str_asr_hyp)
+        str_ground_truths.append(str_gt)
+    
+    # Compute metrics
+    dfm_wer = wer(str_targets, str_hyps)
+    asr_wer = wer(str_targets, str_asr_hyps)
+    gt_wer = wer(str_targets, str_ground_truths)
+    accuracy = correct_predictions / num_samples_to_use
+    
+    logger.info(f"DFM WER: {dfm_wer * 100:.4f}%")
+    logger.info(f"ASR WER: {asr_wer * 100:.4f}%")
+    logger.info(f"Ground Truth WER: {gt_wer * 100:.4f}%")
+    logger.info(f"Exact Matching: {accuracy * 100:.4f}% ({correct_predictions}/{num_samples_to_use})")
+    
+    return {
+        'dfm_wer': dfm_wer,
+        'asr_wer': asr_wer,
+        'gt_wer': gt_wer,
+        'accuracy': accuracy,
+        'total_samples': num_samples_to_use,
+        'correct_predictions': correct_predictions,
+    }
+
+
+# -------------------------
 # Train loop
 # -------------------------
 def train_dfm(
     args: ArgumentParser,
     dfm_model,    
     train_loader,
-    eval_loader,
+    eval_dataset,
     optim,
     optim_scheduler,    
-    grad_clip: float = 1.0,
-    use_amp: bool = True,
+    grad_clip: float = 1.0,    
     mask_id = 1,
-    init_step: int = 0,
-    debugging: bool = False,    
+    tokenizer = None,
+    init_condition: Optional[Dict] = None,        
 ):
     if args.save_dir is None:
         logger.info(f"Save dir: {args.save_dir}")
@@ -134,25 +267,26 @@ def train_dfm(
         logger.info(f"save_dir will be 'garbage'")
         save_dir = "garbage"
     else:
-        save_dir = args.save_dir
+        save_dir = args.save_dir        
         os.makedirs(save_dir, exist_ok=True)
 
+    """
     if args.use_additional_loss_only:
         logger.warning("[WARNING] Using only additional loss for training.")
         logger.warning("n_step should be set to 2 for this setting.")
         args.n_step = 2
         logger.info(f"Setting args.n_step to {args.n_step}")
+    """
 
     device = (
-        dfm_model.device 
+        next(dfm_model.parameters()).device
         if not isinstance(dfm_model, torch.nn.DataParallel) 
-        else dfm_model.module.device
+        else next(dfm_model.module.parameters()).device
     )
     device_str = str(device)
     use_cuda = "cuda" in device_str
     scaler = GradScaler(enabled=use_cuda)
-    #sp = train_loader.dataset.sp
-    # a convex path path
+    
     scheduler = PolynomialConvexScheduler(n=2.0)
     path = MixtureDiscreteProbPath(scheduler=scheduler)
 
@@ -170,66 +304,61 @@ def train_dfm(
     loss_ema = None
     ema_beta = getattr(args, "loss_ema_beta", 0.98)
     
-    train_iter = iter(train_loader)    
-    for step in range(init_step, args.total_step):
-        # train mode
-        dfm_model.train()
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
-        
-        # batch
-        (
-            audio_feats, audio_feat_mask,
-            text_feats, text_feat_mask,
-            gts, hyps,
-            gt_mask, hyp_mask,
-            str_gts, str_hyps,
-        ) = batch
+    step = init_condition.get("step", 1) if init_condition is not None else 1
+    init_epoch = init_condition.get("epoch", 1) if init_condition is not None else 1
 
-        # x1: B, T_o
-        # dtype/shape 정리
-        audio_feats = audio_feats.to(device) # B, T, D
-        audio_feat_mask = audio_feat_mask.to(device)
-        text_feats = text_feats.to(device)
-        text_feat_mask = text_feat_mask.to(device)
-        x1 = gts.to(device)
-        x1_mask = gt_mask.to(device)
+    for epoch in range(init_epoch, args.final_epoch + 1):        
+        logger.info(f"===== Starting epoch {epoch} =====")
         
-        K = args.vocab_size
-        B = x1.size(0)
-        T = args.max_output_length
+        # Training mode
+        dfm_model.train()
         
-        optim.zero_grad(set_to_none=True)
-        
-        if not args.use_additional_loss_only:
+        for batch in train_loader:
+            # batch
+            (
+                audio_feats, audio_feat_mask,
+                text_feats, text_feat_mask,
+                gts, hyps,
+                gt_mask, hyp_mask,
+                str_gts, str_hyps,
+            ) = batch
+
+            # x1: B, T_o
+            # dtype/shape 정리
+            audio_feats = audio_feats.to(device) # B, T, D
+            audio_feat_mask = audio_feat_mask.to(device)
+            text_feats = text_feats.to(device)
+            text_feat_mask = text_feat_mask.to(device)
+            x1 = gts.to(device)
+            x1_mask = gt_mask.to(device)
+            
+            K = args.vocab_size
+            B = x1.size(0)
+            T = args.max_output_length
+            
+            optim.zero_grad(set_to_none=True)
+            
             # sample time t ~ Uniform(eps,1)
             t = torch.rand(B, device=device).clamp(1e-4, 1.0 - 1e-4)
-        else:
-            t = torch.zeros(B, device=device)
 
-        if args.uniform:
-            # x0 ~ Uniform(0, K-1) , (B, T_out, K)
-            x0 = torch.randint(0, K, (B, T), device=device)
-        else:
-            # x0 ~ Mask(0, K-1)
-            x0 = torch.full_like(x1, mask_id, device=device)
+            if args.uniform:
+                # x0 ~ Uniform(0, K-1) , (B, T_out, K)
+                x0 = torch.randint(0, K, (B, T), device=device)
+            else:
+                # x0 ~ Mask(0, K-1)
+                x0 = torch.full_like(x1, mask_id, device=device)
 
-        sample = path.sample(t=t, x_0=x0, x_1=x1)
-        
-        with torch.amp.autocast('cuda', enabled=False):
-            # logits B, T, K
-            logits = dfm_model(x_t=sample.x_t,
-                               t=sample.t,
-                               audio_feats=audio_feats,
-                               audio_mask=audio_feat_mask,
-                               text_feats=text_feats,
-                               text_mask=text_feat_mask)
+            sample = path.sample(t=t, x_0=x0, x_1=x1)
             
-            # DFM loss (skip if using additional_loss_only)
-            if not args.use_additional_loss_only:
+            with torch.amp.autocast('cuda', enabled=False):
+                # logits B, T, K
+                logits = dfm_model(x_t=sample.x_t,
+                                t=sample.t,
+                                audio_feats=audio_feats,
+                                audio_mask=audio_feat_mask,
+                                text_feats=text_feats,
+                                text_mask=text_feat_mask)
+
                 if args.loss_type == "ce":
                     corrupt_mask = (x1 != sample.x_t)  # B, T_out
                     logits_perm = logits.permute(0, -1, 1)
@@ -239,138 +368,96 @@ def train_dfm(
                     dit_loss = (dit_loss * mask).sum() / denom
                 elif args.loss_type == "gkl":
                     dit_loss = criterion(logits=logits,
-                                         x_1=sample.x_1,
-                                         x_t=sample.x_t,
-                                         t=sample.t)
-            else:
-                dit_loss = torch.tensor(0.0, device=device)
+                                        x_1=sample.x_1,
+                                        x_t=sample.x_t,
+                                        t=sample.t)
 
-            # Additional loss (skip if not enabled)
-            additional_loss = torch.tensor(0.0, device=device)
-            if args.use_additional_loss or args.use_additional_loss_only:
-                logits_perm = logits.permute(0, -1, 1)  # B, K, T
-                additional_loss = F.cross_entropy(
-                    logits_perm, x1, reduction="mean"
+
+                # Additional loss (skip if not enabled)
+                additional_loss = torch.tensor(0.0, device=device)
+                if args.use_additional_loss:
+                    logits_perm = logits.permute(0, -1, 1)  # B, K, T
+                    additional_loss = criterion(logits_perm, x1).mean()                    
+
+            # Final loss combination
+            loss = dit_loss + args.alpha * additional_loss
+
+            prev_scale = scaler.get_scale()
+            scaler.scale(loss).backward()
+            if grad_clip is not None:
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(
+                    dfm_model.parameters(),
+                    grad_clip
                 )
+            scaler.step(optim)
+            scaler.update()
 
-        # Final loss combination
-        loss = dit_loss + args.alpha * additional_loss
+            if scaler.get_scale() >= prev_scale:
+                optim_scheduler.step()
 
-        prev_scale = scaler.get_scale()
-        scaler.scale(loss).backward()
-        if grad_clip is not None:
-            scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(
-                dfm_model.parameters(),
-                grad_clip
-            )
-        scaler.step(optim)
-        scaler.update()
-
-        if scaler.get_scale() >= prev_scale:
-            optim_scheduler.step()
-
-        loss_val = float(loss.detach().cpu())        
-        if loss_ema is None:
-            loss_ema = loss_val
-        else:
-            loss_ema = ema_beta * loss_ema + (1.0 - ema_beta) * loss_val        
-        
-        if step % args.log_step == 0:
-            logger.info(f"[step {step:,}] "
-                    f"loss={loss_val:.4f}, "
-                    f"loss_ema={loss_ema:.4f}, "
-                    f"dit_loss={float(dit_loss.detach().cpu()):.4f}, "
-                    f"additional_loss={float(additional_loss.detach().cpu()):.4f}, "
-                    f"lr={optim_scheduler.get_last_lr()[0]:.6f}, "
-                    f"alpha={args.alpha} "
-            )
-            #break # for debugging
-        
-        if step % args.save_step == 0:
-            # save each epoch
-            ckpt_path = os.path.join(save_dir, f"model_step{step}.pt")
-            torch.save(
-                {
-                    "step": step,
-                    "model": dfm_model.state_dict(),
-                    "optim": optim.state_dict(),
-                    "scaler": scaler.state_dict(),
-                    "K": K,
-                },
-                ckpt_path,
-            )
-            logger.info(f"Saved: {ckpt_path}")
-            
-            probability_denoiser = DFMModelWrapper(dfm_model)
-
-            if debugging is True:
-                sampling_method = sampling_debugging
+            loss_val = float(loss.detach().cpu())        
+            if loss_ema is None:
+                loss_ema = loss_val
             else:
-                sampling_method = sampling_batch
+                loss_ema = ema_beta * loss_ema + (1.0 - ema_beta) * loss_val        
+            
+            if step % args.log_step == 0:
+                logger.info(f"[Epoch {epoch}] "
+                        f"[step {step:,}] "
+                        f"lr={optim_scheduler.get_last_lr()[0]:.6f}, "
+                        f"loss={loss_val:.4f}, "
+                        f"loss_ema={loss_ema:.4f}, "
+                        f"dit_loss={float(dit_loss.detach().cpu()):.4f}, "
+                        f"additional_loss={float(additional_loss.detach().cpu()):.4f}, "                        
+                        f"alpha={args.alpha}, "
+                ) 
+            """
+            if step % args.eval_step == 0:
+                logger.info(f"===== Validation at step {step} =====")
+                validate(
+                    dfm_model=dfm_model,
+                    eval_dataset=eval_dataset,
+                    tokenizer=tokenizer,
+                    args=args,
+                    mask_id=mask_id,
+                    device=device,
+                    num_samples=args.num_samples,
+                    debugging=args.debugging,
+                )
+                dfm_model.train()
+            """
 
-            hyps, targets, asr_hyps, str_gts = sampling_method(
-                test_dl=eval_loader,
-                model=probability_denoiser,
-                n_step=args.n_step,
-                K=K,
-                max_output_length=args.max_output_length,
-                mask_id=mask_id,
-                return_intermediates=True,
-                is_uniform=False,
-                device=device,
-            )
+            # Increment step counter
+            step += 1
 
-            str_hyps = []
-            str_targets = []
-            str_asr_hyps = []
-            str_ground_truths = []
-            correct_predictions = 0
-            B = len(hyps)
-            #TODO
-            total_samples = B
-            for b in range(B):
-                hyp_ids = hyps[b]
-                target_ids = targets[b]
-                asr_hyp_ids = asr_hyps[b]
-                str_gt = str_gts[b]
-                
-                hyp = tokenizer.decode(hyp_ids, group_tokens=False)
-                target = tokenizer.decode(target_ids, group_tokens=False)
-                asr_hyp = tokenizer.decode(asr_hyp_ids, group_tokens=False)
-                if args.verbose:
-                    logger.info(f"GT: {str_gt.split(' ')}")
-                    logger.info(f"TARGET: {target.split(' ')}")
-                    logger.info(f"ASR HYP: {asr_hyp.split(' ')}")
-                    logger.info(f"DFM HYP: {hyp.split(' ')}")
-                    logger.info("-----")            
-                if hyp == target:
-                    correct_predictions += 1
-
-                str_hyps.append(hyp)
-                str_targets.append(target)
-                str_asr_hyps.append(asr_hyp)
-                str_ground_truths.append(str_gt)
-
-            # compute WER
-            wer_score = wer(str_targets, str_hyps)
-            logger.info(f"DFM WER: {wer_score * 100:.4f}%")    
-
-            wer_score = wer(str_targets, str_asr_hyps)
-            logger.info(f"ASR WER: {wer_score * 100:.4f}%")
-
-            wer_score = wer(str_targets, str_ground_truths)
-            logger.info(f"Ground Truth WER: {wer_score * 100:.4f}%")
-
-            accuracy = correct_predictions / total_samples
-            logger.info(f"Exact Matching: {accuracy * 100:.4f}% ({correct_predictions}/{total_samples})")
-
-            total = len(hyps)
-            correct = 0
-            for hyp, target in zip(hyps, targets):
-                if hyp == target:
-                    correct += 1
-            logger.info(f"Step {step} - Exact Matching: {correct/total * 100:.4f} ({correct}/{total})")
+        # End of epoch        
+        ckpt_path = os.path.join(save_dir, f"model_epoch{epoch}.pt")
+        torch.save(
+            {
+                "step": step,
+                "model": dfm_model.state_dict(),
+                "optim": optim.state_dict(),
+                "scaler": scaler.state_dict(),
+                "epoch": epoch,
+                "K": K,
+            },
+            ckpt_path,
+        )
+        logger.info(f"Saved: {ckpt_path}")
+        
+        # Run validation with random sampling
+        logger.info(f"===== Validation at epoch {epoch} =====")
+        validate(
+            dfm_model=dfm_model,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            args=args,
+            mask_id=mask_id,
+            device=device,
+            num_samples=args.num_samples,
+            debugging=args.debugging,
+        )        
 
     return
 
@@ -378,6 +465,12 @@ def train_dfm(
 if __name__ == "__main__":
 
     args = build_parser().parse_args()
+
+    # remove save_dir if reset_save_dir is True
+    if args.reset_save_dir and os.path.exists(args.save_dir):
+        import shutil
+        shutil.rmtree(args.save_dir)
+            
     setup_logger(args.save_dir, log_name="train")
     logger = logging.getLogger(__name__)
     
@@ -392,7 +485,7 @@ if __name__ == "__main__":
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
     """
-    device = args.device
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     # tokenizer
     processor = AutoProcessor.from_pretrained(args.tokenizer_model_name)
     # adding numbers from 0 to 9 + "[MASK]" if not already present
@@ -423,7 +516,8 @@ if __name__ == "__main__":
     logger.info(f"* DFMConfig: ")
     logger.info(json.dumps(asdict(cfg), indent=2))
     
-    dfm_model = DFMModel(cfg, device=device)
+    #dfm_model = DFMModel(cfg, device=device)
+    dfm_model = DFMModel(cfg)
     
     if args.ckpt_path is not None:        
         checkpoint = torch.load(args.ckpt_path, map_location=device)
@@ -431,7 +525,7 @@ if __name__ == "__main__":
         dfm_model.load_state_dict(state_dict)        
         logger.info(f"* Loaded checkpoint from {args.ckpt_path}")
 
-    logger.info(f"{dfm_model.device=}")
+    #logger.info(f"{dfm_model.device=}")
     trainable_params = 0
     for model in [dfm_model.dit]:
         tmp_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -441,17 +535,41 @@ if __name__ == "__main__":
 
     # 멀티 GPU 지원    
     primary_gpu_id = 0
-    if device == "cuda" and torch.cuda.device_count() > 1:
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
         gpu_ids = [int(x) for x in args.gpu.split(",")]
         num_gpus = len(gpu_ids)        
         logger.info(f"{torch.cuda.device_count()} GPUs are available")
         logger.info(f"GPU option: '{args.gpu}'")
         logger.info(f"Using {num_gpus} GPUs (IDs: {gpu_ids})")
         if num_gpus > 1:
-            # 지정된 GPU들만 사용
-            dfm_model = torch.nn.DataParallel(dfm_model, device_ids=gpu_ids)
-            # Primary device를 첫 번째 GPU로 설정
-            dfm_model = dfm_model.to(f"cuda:{gpu_ids[0]}")            
+            primary_gpu_id = gpu_ids[0]
+            device = torch.device(f"cuda:{primary_gpu_id}")
+            dfm_model = dfm_model.to(device)                        
+            dfm_model = torch.nn.DataParallel(dfm_model,
+                                              device_ids=gpu_ids,
+                                              output_device=primary_gpu_id)
+        else:
+            device = torch.device(f"cuda:{gpu_ids[0]}")            
+            dfm_model = dfm_model.to(device)        
+            #logger.info(f"{dfm_model.device=}")      
+            logger.info(f"cuda:{gpu_ids[0]} 단일 GPU 사용")      
+    else:
+        if device.type == "cuda":
+            gpu_ids = [int(x) for x in args.gpu.split(",")]        
+            device = torch.device(f"cuda:{gpu_ids[0]}")
+            dfm_model = dfm_model.to(device)
+            logger.info(f"Using single GPU: {device}")
+        else:
+            logger.info("Using CPU device")
+            dfm_model = dfm_model.to(device)
+    """
+    # Device 정보 확인
+    logger.info(f"Device type: {device.type}")
+    logger.info(f"Device index: {device.index}")
+    logger.info(f"Device string: {str(device)}")
+    logger.info(f"Model device: {dfm_model.device}")
+    """
+    #import sys; sys.exit(0)
 
     optim = torch.optim.AdamW(
         list(dfm_model.parameters()),
@@ -471,15 +589,17 @@ if __name__ == "__main__":
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     optim_scheduler = LambdaLR(optim, lr_lambda)
-    scaler = GradScaler(enabled=(device.startswith("cuda")))
-    init_step = 0
+    scaler = GradScaler(enabled=(device.type == "cuda"))    
 
+    init_condition = {}
     if args.ckpt_path is not None:
         optim.load_state_dict(checkpoint["optim"])        
-        scaler.load_state_dict(checkpoint["scaler"])
-        init_step = checkpoint["step"] + 1
+        scaler.load_state_dict(checkpoint["scaler"])        
+        init_condition["step"] = checkpoint.get("step", 0) + 1
+        init_condition["epoch"] = checkpoint.get("epoch", 0) + 1
         logger.info(f"* Loaded optimizer and scaler states from {args.ckpt_path}, "
-                     f"resuming from step {init_step}")    
+                    f"resuming from step {init_condition['step']}, "
+                    f"epoch {init_condition['epoch']}. ")
  
     train_dataset = HuBERTandDeBERTaDataset(
         task=args.train_task,
@@ -504,8 +624,7 @@ if __name__ == "__main__":
     total_train_data_count = len(train_dl.dataset)
     logger.info(f"* 전체 train 데이터 개수: {total_train_data_count:,}")
 
-    # TODO
-    # 현재는 1024개만 추출하는 것으로    
+    # Evaluation dataset (전체 로드, validation에서 매번 무작위 샘플링)
     eval_dataset = HuBERTandDeBERTaDataset(
         task=args.eval_task,
         tokenizer=tokenizer,
@@ -514,23 +633,10 @@ if __name__ == "__main__":
         debugging_num=args.dataset_debugging_num,
         use_tar=args.use_tar,
     )
-    total_eval_len = len(eval_dataset)
-    indices = torch.randperm(total_eval_len)[:1024]
-    small_eval_dataset = Subset(eval_dataset, indices)
-
-    eval_sampler = BatchSampler(small_eval_dataset,
-                                batch_size=args.test_batch_size,
-                                shuffle=True)
-
-    eval_dl = DataLoader(
-        eval_dataset,
-        batch_sampler=eval_sampler,
-        num_workers=args.num_workers,
-        collate_fn=hubert_and_deberta_dataset_collate_fn,
-    )
-
-    total_eval_data_count = len(eval_dl.dataset)
-    logger.info(f"* 전체 eval 데이터 개수: {total_eval_data_count:,}")
+    
+    total_eval_samples = len(eval_dataset)
+    logger.info(f"* 전체 eval 데이터 개수: {total_eval_samples:,}")
+    logger.info(f"* Validation 시 매번 {min(args.num_samples, total_eval_samples):,}개를 무작위 샘플링합니다")
 
     mask_id = tokenizer.convert_tokens_to_ids(args.mask_token)
     logger.info(f"* {args.mask_token}의 ID: {mask_id}")
@@ -539,10 +645,10 @@ if __name__ == "__main__":
         args=args,
         dfm_model=dfm_model,
         train_loader=train_dl,
-        eval_loader=eval_dl,
+        eval_dataset=eval_dataset,
         optim=optim,
         optim_scheduler=optim_scheduler,
         mask_id=mask_id,
-        init_step=init_step,
-        debugging=args.debugging,        
+        tokenizer=tokenizer,        
+        init_condition=init_condition,        
     )
