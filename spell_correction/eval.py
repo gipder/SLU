@@ -1,5 +1,6 @@
 import logging
 import sys
+from tabnanny import verbose
 import torch
 from torch.utils.data import DataLoader
 
@@ -10,7 +11,7 @@ from dataclasses import asdict
 
 from transformers import AutoProcessor
 import os
-from jiwer import wer
+from jiwer import wer, process_words, process_characters
 
 # my implementation
 from model import DFMModel, DFMModelConfig, DFMModelWrapper
@@ -18,6 +19,7 @@ from hubert_deberta_dataset import HuBERTandDeBERTaDataset
 from hubert_deberta_dataset import hubert_and_deberta_dataset_collate_fn
 from hubert_deberta_dataset import BatchSampler
 from sampling import sampling_batch, sampling_debugging
+from utils import compute_wer_cer
 from utils import set_seed, seed_worker
 from utils import setup_logger
 from utils import str2bool
@@ -67,7 +69,7 @@ def build_parser():
     #p.add_argument("--shuffle_train", type=bool, default=True)
 
     # ---- debugging ----
-    p.add_argument("--debugging", action="store_true", default=False, help="Enable debugging mode for train_dfm()")    
+    p.add_argument("--debugging", action="store_true", default=False, help="Enable debugging mode for eval_dfm()")    
     p.add_argument("--debugging_num", type=int, default=128, help="How many samples are used in debugging")
     p.add_argument("--verbose", action="store_true", default=False)
     p.add_argument("--use_oracle_length", action="store_true", default=False)
@@ -88,9 +90,11 @@ def eval_dfm(
 ):
     dfm_model.eval()
 
-    device = dfm_model.device \
-        if isinstance(dfm_model, DFMModel) \
-        else dfm_model.module.device
+    device = (
+        next(dfm_model.parameters()).device
+        if not isinstance(dfm_model, torch.nn.DataParallel) 
+        else next(dfm_model.module.parameters()).device
+    )    
 
     total_samples = len(test_loader.dataset)
     correct_predictions = 0    
@@ -112,53 +116,55 @@ def eval_dfm(
             return_intermediates=True,
             is_uniform=args.uniform,
             device=device,
-            verbose=args.verbose,
-            debugging=args.debugging,
         )
 
-    str_hyps_decoded = []
-    str_targets = []
-    str_ground_truths = str_gts  # 이미 문자열 형태
-    
-    B = len(hyps)
-    for b in range(B):
-        hyp_ids = hyps[b]
-        target_ids = targets[b]
+    # id to string conversion
+    blank_id = tokenizer.pad_token_id
+    hyp_texts = []
+    ref_texts = []
+    for hyp_ids, target_ids in zip(hyps, targets):
+        # Remove blank tokens
+        hyp_ids_cleaned = [id for id in hyp_ids if id != blank_id]
+        target_ids_cleaned = [id for id in target_ids if id != blank_id]
         
-        hyp = tokenizer.decode(hyp_ids, group_tokens=False)
-        target = tokenizer.decode(target_ids, group_tokens=False)
-        
+        hyp_text = tokenizer.decode(hyp_ids_cleaned, group_tokens=False, skip_special_tokens=True)
+        ref_text = tokenizer.decode(target_ids_cleaned, group_tokens=False, skip_special_tokens=True)
         if args.verbose:
-            logger.info(f"GT: {str_gts[b].split(' ')}")
-            logger.info(f"TARGET: {target.split(' ')}")
-            logger.info(f"ASR HYP: {str_hyps[b].split(' ')}")
-            logger.info(f"DFM HYP: {hyp.split(' ')}")
-            logger.info("-----")            
-        if hyp == target:
-            correct_predictions += 1
+            logger.info(f"Hypothesis: {hyp_text}")
+            logger.info(f"Reference:  {ref_text}")
+            logger.info("-----")
+        
+        hyp_texts.append(hyp_text)
+        ref_texts.append(ref_text)
 
-        str_hyps_decoded.append(hyp)
-        str_targets.append(target)
+    results = compute_wer_cer(hyp_texts, ref_texts)
+    asr_results = compute_wer_cer(str_hyps, str_gts)        
+    gt_results = compute_wer_cer(ref_texts, str_gts)
 
     # compute WER
-    result = {}
-    wer_score = wer(str_targets, str_hyps_decoded)
-    logger.info(f"DFM WER: {wer_score * 100:.4f}%")    
-    result["dfm_wer"] = wer_score
+    #result = {}
+    #wer_score = wer(str_targets, str_hyps_decoded)
+    logger.info(f"DFM WER: {results['wer'] * 100:.4f}%")    
+    #result["dfm_wer"] = wer_score
 
-    wer_score = wer(str_targets, str_hyps)
-    logger.info(f"ASR WER: {wer_score * 100:.4f}%")
-    result["asr_wer"] = wer_score
+    #wer_score = wer(str_targets, str_hyps)
+    results["asr_wer"] = asr_results["wer"]
+    logger.info(f"ASR WER: {results['asr_wer'] * 100:.4f}%")
 
-    wer_score = wer(str_targets, str_ground_truths)
-    logger.info(f"Ground Truth WER: {wer_score * 100:.4f}%")
-    result["gt_wer"] = wer_score
+    results["gt_wer"] = gt_results["wer"]
+    logger.info(f"GT WER: {results['gt_wer'] * 100:.4f}%")
+    #result["asr_wer"] = wer_score
 
-    accuracy = correct_predictions / total_samples
-    logger.info(f"Exact Matching: {accuracy * 100:.4f}% ({correct_predictions}/{total_samples})")    
-    result["accuracy"] = accuracy
-
-    return result
+    # adding senteces for debugging
+    results["sentences"] = []
+    for i in range(len(str_gts)):
+        results["sentences"].append({
+            "ground_truth": str_gts[i],
+            "asr_hypothesis": str_hyps[i],
+            "dfm_hypothesis": tokenizer.decode(hyps[i], group_tokens=False),
+        })
+        
+    return results
 
 
 def main(args):
@@ -191,7 +197,7 @@ def main(args):
     logger.info(f"* DFMConfig: ")
     logger.info(json.dumps(asdict(cfg), indent=2))
     
-    dfm_model = DFMModel(cfg, device=device)
+    dfm_model = DFMModel(cfg)
 
     assert os.path.exists(args.ckpt_path), f"Checkpoint path {args.ckpt_path} does not exist."    
     
@@ -218,9 +224,16 @@ def main(args):
         else:
             device = torch.device(f"cuda:{gpu_ids[0]}")
             dfm_model = dfm_model.to(device)
+            logger.info(f"Using single GPU: cuda:{gpu_ids[0]}")      
     else:
-        logger.info("Using CPU device")
-        dfm_model = dfm_model.to(device)          
+        if device.type == "cuda":
+            gpu_ids = [int(x) for x in args.gpu.split(",")]        
+            device = torch.device(f"cuda:{gpu_ids[0]}")
+            dfm_model = dfm_model.to(device)
+            logger.info(f"Using single GPU: {device}")
+        else:            
+            dfm_model = dfm_model.to(device)
+            logger.info("Using CPU device")
 
     MASK = args.mask_token
     mask_id = tokenizer.convert_tokens_to_ids(MASK)
@@ -260,18 +273,28 @@ def main(args):
             test_loader=test_dl,
             mask_id=mask_id,            
         )
-        dfm_wers.append(results["dfm_wer"])
+        dfm_wers.append(results["wer"])
         asr_wers.append(results["asr_wer"])
-        gt_wers.append(results["gt_wer"])
+        gt_wers.append(results["gt_wer"])        
+
+        #json dump in save_dir
+        model_name = os.path.basename(args.ckpt_path).replace(".pt", "").replace(".pth", "")
+        results_path = os.path.join(args.save_dir, f"{task}_{model_name}_eval_results.json")
+        with open(results_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=4)
+        logger.info(f"Saved evaluation results to {results_path}")    
 
     logger.info("=" * 60)
     logger.info(f"{os.path.basename(args.ckpt_path)} EVALUATION SUMMARY")
     logger.info("-" * 60)
-    for i, task in enumerate(args.test_task):        
+    for i, task in enumerate(args.test_task):    
+        logger.info(f"Total samples in {task} set: {results['num_sentences']}")    
         logger.info(f"{task} DFM WER: {dfm_wers[i] * 100:.4f}%")
-        logger.info(f"{task} ASR WER: {asr_wers[i] * 100:.4f}%")
+        logger.info(f"{task} ASR WER: {asr_wers[i] * 100:.4f}%")        
         logger.info(f"{task} GT WER: {gt_wers[i] * 100:.4f}%")
         logger.info("-" * 60)    
+
+    
 
     return
 

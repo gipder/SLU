@@ -269,9 +269,6 @@ def sampling_debugging(
     """
     model.eval()    
     
-    hyp = []
-    target = []
-    
     batch = next(iter(test_dl))
     (
         audio_feats, audio_feat_mask,
@@ -309,13 +306,16 @@ def sampling_debugging(
     
     hyp = []
     target = []
-    asr_hyp = []
+    str_hyps_list = []
+    str_gts_list = []
+    
     for b in range(x_1_hat.size(0)):
         for s in range(x_1_hat.size(1)):
             ids = x_1_hat[b, s].tolist()
             sentence = ids        
         target.append(gts[b].tolist())
         hyp.append(sentence)
-        asr_hyp.append(hyps[b])
+        str_hyps_list.append(str_hyps[b])
+        str_gts_list.append(str_gts[b])        
 
-    return hyp, target, asr_hyp, str_gts
+    return hyp, target, str_hyps_list, str_gts_list

@@ -42,8 +42,6 @@ from utils import str2bool, remove_module_prefix
 from utils import setup_logger
 
 
-
-
 def build_parser():
     p = argparse.ArgumentParser(description="Train DFM (based on U-Net) with HuBERT + DeBERTa features")
 
@@ -53,11 +51,13 @@ def build_parser():
     p.add_argument("--final_epoch", type=int, default=100,)
     p.add_argument("--log_step", type=int, default=500, help="Logging step interval")
     p.add_argument("--eval_step", type=int, default=5000, help="Evaluation step interval")
+    p.add_argument("--eval_epoch", type=int, default=5, help="Evaluation epoch interval")
     p.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate by warmup step")
     p.add_argument("--warmup_step", type=int, default=2500)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--save_dir", type=str, default=None, help="If None, auto-generated from lr.")
+    p.add_argument("--make_model_dir", type=str2bool, default=True, help="Whether to make model save_dir")
     p.add_argument("--reset_save_dir", type=str2bool, default=False, help="Whether to reset save_dir if exists")
     p.add_argument("--save_step", type=int, default=50000, help="Not using currently")
     p.add_argument("--uniform", type=str2bool, default=False)
@@ -84,6 +84,7 @@ def build_parser():
     p.add_argument("--text_dim", type=int, default=1024)
     p.add_argument("--max_output_length", type=int, default=256, help="Maximum output length during inference")
     p.add_argument("--n_step", type=int, default=5, help="Number of sampling steps during inference")
+    #p.add_argument("--model_type", type=str, choices=["dit", "basic_transformer"], default="dit")
     ## for length predictor
     #p.add_argument("--embed_dim", type=int, default=1024)
     #p.add_argument("--length_hidden_dim", type=int, default=512)
@@ -261,15 +262,7 @@ def train_dfm(
     tokenizer = None,
     init_condition: Optional[Dict] = None,        
 ):
-    if args.save_dir is None:
-        logger.info(f"Save dir: {args.save_dir}")
-        logger.info(f"No specified save_dir")
-        logger.info(f"save_dir will be 'garbage'")
-        save_dir = "garbage"
-    else:
-        save_dir = args.save_dir        
-        os.makedirs(save_dir, exist_ok=True)
-
+    
     """
     if args.use_additional_loss_only:
         logger.warning("[WARNING] Using only additional loss for training.")
@@ -431,8 +424,11 @@ def train_dfm(
             # Increment step counter
             step += 1
 
-        # End of epoch        
-        ckpt_path = os.path.join(save_dir, f"model_epoch{epoch}.pt")
+        # End of epoch     
+        if args.make_model_dir:
+            ckpt_path = os.path.join(save_dir, "model", f"model_epoch{epoch}.pt")
+        else:
+            ckpt_path = os.path.join(save_dir, f"model_epoch{epoch}.pt")
         torch.save(
             {
                 "step": step,
@@ -447,17 +443,18 @@ def train_dfm(
         logger.info(f"Saved: {ckpt_path}")
         
         # Run validation with random sampling
-        logger.info(f"===== Validation at epoch {epoch} =====")
-        validate(
-            dfm_model=dfm_model,
-            eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
-            args=args,
-            mask_id=mask_id,
-            device=device,
-            num_samples=args.num_samples,
-            debugging=args.debugging,
-        )        
+        if epoch % args.eval_epoch == 0:
+            logger.info(f"===== Validation at epoch {epoch} =====")
+            validate(
+                dfm_model=dfm_model,
+                eval_dataset=eval_dataset,
+                tokenizer=tokenizer,
+                args=args,
+                mask_id=mask_id,
+                device=device,
+                num_samples=args.num_samples,
+                debugging=args.debugging,
+            )        
 
     return
 
@@ -467,13 +464,22 @@ if __name__ == "__main__":
     args = build_parser().parse_args()
 
     # remove save_dir if reset_save_dir is True
-    if args.reset_save_dir and os.path.exists(args.save_dir):
+    if args.reset_save_dir and os.path.exists(args.save_dir):        
         import shutil
         shutil.rmtree(args.save_dir)
-            
+
+    if args.save_dir is None:
+        args.save_dir = "garbage"        
+    else:
+        save_dir = args.save_dir        
+        os.makedirs(save_dir, exist_ok=True)
+        
+    if args.make_model_dir:
+        os.makedirs(os.path.join(args.save_dir, "model"), exist_ok=True)
+    
     setup_logger(args.save_dir, log_name="train")
     logger = logging.getLogger(__name__)
-    
+
     # Save command line
     logger.info(f"* Command Line: {' '.join(sys.argv)}")
     logger.info(f"* Configuration")
@@ -552,16 +558,16 @@ if __name__ == "__main__":
             device = torch.device(f"cuda:{gpu_ids[0]}")            
             dfm_model = dfm_model.to(device)        
             #logger.info(f"{dfm_model.device=}")      
-            logger.info(f"cuda:{gpu_ids[0]} 단일 GPU 사용")      
+            logger.info(f"Using single GPU: cuda:{gpu_ids[0]}")      
     else:
         if device.type == "cuda":
             gpu_ids = [int(x) for x in args.gpu.split(",")]        
             device = torch.device(f"cuda:{gpu_ids[0]}")
             dfm_model = dfm_model.to(device)
             logger.info(f"Using single GPU: {device}")
-        else:
-            logger.info("Using CPU device")
+        else:            
             dfm_model = dfm_model.to(device)
+            logger.info("Using CPU device")
     """
     # Device 정보 확인
     logger.info(f"Device type: {device.type}")
@@ -622,7 +628,7 @@ if __name__ == "__main__":
     )
 
     total_train_data_count = len(train_dl.dataset)
-    logger.info(f"* 전체 train 데이터 개수: {total_train_data_count:,}")
+    logger.info(f"* number of total train data: {total_train_data_count:,}")
 
     # Evaluation dataset (전체 로드, validation에서 매번 무작위 샘플링)
     eval_dataset = HuBERTandDeBERTaDataset(
@@ -635,11 +641,11 @@ if __name__ == "__main__":
     )
     
     total_eval_samples = len(eval_dataset)
-    logger.info(f"* 전체 eval 데이터 개수: {total_eval_samples:,}")
-    logger.info(f"* Validation 시 매번 {min(args.num_samples, total_eval_samples):,}개를 무작위 샘플링합니다")
+    logger.info(f"* number of total eval data: {total_eval_samples:,}")
+    logger.info(f"* Sampling {min(args.num_samples, total_eval_samples):,} samples randomly for each validation.")
 
     mask_id = tokenizer.convert_tokens_to_ids(args.mask_token)
-    logger.info(f"* {args.mask_token}의 ID: {mask_id}")
+    logger.info(f"* ID of {args.mask_token}: {mask_id}")
 
     train_dfm(
         args=args,

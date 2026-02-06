@@ -2,3 +2,5 @@ baseline*
 hubert_cache/
 hubert_deberta_cache_retrial/
 hubert_deberta_tar/
+additional_loss*
+old_*

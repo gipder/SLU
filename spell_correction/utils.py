@@ -174,7 +174,49 @@ def make_gif_from_xts(
 
     raise ValueError("mode must be 'animate' or 'stack'")
 
+def compute_wer_cer(text_hyps_list, text_targets_list):
+    """
+    Compute WER (Word Error Rate) and CER (Character Error Rate) using jiwer.
+    
+    Args:
+        text_hyps_list: List of hypothesis string lists
+        text_targets_list: List of target string lists
+                
+    Returns:
+        Dictionary containing:
+            - wer: Word Error Rate (0-1)
+            - cer: Character Error Rate (0-1)
+            - num_sentences: Total number of sentences
+            - wer_details: Dict with 'hits', 'substitutions', 'deletions', 'insertions'
+            - cer_details: Dict with 'hits', 'substitutions', 'deletions', 'insertions'
+    """
+    
+    assert len(text_hyps_list) == len(text_targets_list), "Length mismatch between hyps and targets"
+    # Compute detailed metrics using jiwer.compute_measures
+    word_measures = process_words(text_targets_list, text_hyps_list)
+    character_measures = process_characters(text_targets_list, text_hyps_list)    
+    
+    results = {
+        'num_sentences': len(text_targets_list),
+        'wer': word_measures.wer,
+        'cer': character_measures.cer,
+        'wer_details': {            
+            'hits': word_measures.hits,
+            'substitutions': word_measures.substitutions,
+            'deletions': word_measures.deletions,
+            'insertions': word_measures.insertions,
+        },
+        'cer_details': {            
+            'hits': character_measures.hits,
+            'substitutions': character_measures.substitutions,
+            'deletions': character_measures.deletions,
+            'insertions': character_measures.insertions,
+        }
+    }
 
+    return results
+
+'''
 def compute_wer_cer(hyps_list, targets_list, tokenizer, blank_id, verbose=False):
     """
     Compute WER (Word Error Rate) and CER (Character Error Rate) using jiwer.
@@ -255,5 +297,6 @@ def compute_wer_cer(hyps_list, targets_list, tokenizer, blank_id, verbose=False)
             'insertions': character_measures.insertions,
         }
     }
-    
+
     return results
+'''
