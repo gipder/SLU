@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from dit import DiscreteDualDiT
-#from length_predictor import MaskedLengthPredictionModule
+from length_predictor import MaskedLengthPredictionModule
 from flow_matching.utils import ModelWrapper
 
 @dataclass
@@ -19,11 +19,11 @@ class DFMModelConfig:
     max_output_length: int = 256
     n_step: int = 4
     # Length Predictor 설정
-    #embed_dim: int = audio_dim
-    #length_hidden_dim: int = 512
-    #max_target_positions: int = 128
-    #length_dropout: float = 0.1
-    #length_condition: str = "text"  # "audio" or "text"
+    embed_dim: int = audio_dim
+    length_hidden_dim: int = 512
+    max_target_positions: int = 128
+    length_dropout: float = 0.1
+    length_condition: str = "text"  # "audio" or "text" or "both"
     
 
 class DFMModelWrapper(ModelWrapper):
