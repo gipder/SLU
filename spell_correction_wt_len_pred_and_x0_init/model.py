@@ -7,6 +7,14 @@ from dit import DiscreteDualDiT
 from length_predictor import MaskedLengthPredictionModule
 from flow_matching.utils import ModelWrapper
 
+# for DFM testing
+from flow_matching.path import MixtureDiscreteProbPath
+from flow_matching.path.path_sample import DiscretePathSample
+from flow_matching.path.scheduler import PolynomialConvexScheduler
+from flow_matching.utils import ModelWrapper
+from flow_matching.loss import MixturePathGeneralizedKL
+from flow_matching.solver import MixtureDiscreteEulerSolver
+
 @dataclass
 class DFMModelConfig:
     # DIT 설정
@@ -16,12 +24,15 @@ class DFMModelConfig:
     num_heads: int = 8
     audio_dim: int = 1024
     text_dim: int = 1024
+    max_output_length: int = 256
+    n_step: int = 4
     # Length Predictor 설정
     embed_dim: int = audio_dim
     length_hidden_dim: int = 512
-    max_target_positions: int = 128
+    max_target_positions: int = max_output_length
     length_dropout: float = 0.1
-    length_condition: str = "text"  # "audio" or "text"
+    length_condition: str = "text"  # "audio" or "text" or "both"
+    length_margin: float = 0.1
     
 
 class DFMModelWrapper(ModelWrapper):
@@ -33,38 +44,34 @@ class DFMModelWrapper(ModelWrapper):
         audio_mask = extras["audio_mask"]
         text_feats = extras["text_feats"]
         text_mask = extras["text_mask"]        
-        logits, _ = self.model(x, t, audio_feats, audio_mask, text_feats, text_mask) # B, T_out, K
+        logits = self.model(x, t, audio_feats, audio_mask, text_feats, text_mask) # B, T_out, K
         prob = torch.nn.functional.softmax(logits.float(), dim=-1)
         return prob
     
-    def get_length_logits(self, x: torch.Tensor, x_mask: torch.Tensor) -> torch.Tensor:
-        length_logits = self.model.length_predictor(x, ~(x_mask.bool()))
-        #print(f"{length_logits.argmax(dim=-1)=}")
-        return length_logits        
-
+    def predict_lengths(self, x: torch.Tensor, x_mask: torch.Tensor) -> torch.Tensor: # B
+        predict_lengths = self.model.predict_lengths(x, x_mask)
+        return predict_lengths
+    
 
 class DFMModel(nn.Module):
-    def __init__(self, cfg: DFMModelConfig, device=None):
+    def __init__(self, cfg: DFMModelConfig):
         super().__init__()
-        self.cfg = cfg
-        self.device = torch.device(device) if device else None
+        self.cfg = cfg        
         self.dit = DiscreteDualDiT(
             vocab_size=cfg.vocab_size,
             hidden_size=cfg.hidden_size,
             depth=cfg.depth,
             num_heads=cfg.num_heads,
             audio_dim=cfg.audio_dim,
-            text_dim=cfg.text_dim
+            text_dim=cfg.text_dim,            
         )
+        
         self.length_predictor = MaskedLengthPredictionModule(
             embed_dim=cfg.embed_dim,
             length_hidden_dim=cfg.length_hidden_dim,
             max_target_positions=cfg.max_target_positions,
             length_dropout=cfg.length_dropout
-        )
-
-        if self.device is not None:
-            self.to(self.device)        
+        )        
 
     def forward(
         self,
@@ -75,12 +82,13 @@ class DFMModel(nn.Module):
         text_feats: torch.Tensor = None,
         text_mask: torch.Tensor = None,        
     ) -> torch.Tensor:
-
+        """
         # x_t: B, T
         B = x_t.shape[0]
         T = x_t.shape[1]
         K = self.cfg.vocab_size
         
+
         if self.cfg.length_condition == "text":
             length_logits = self.length_predictor(
                 text_feats, ~(text_mask.bool())
@@ -91,14 +99,40 @@ class DFMModel(nn.Module):
             )
         else:
             raise ValueError(f"Unknown length_condition: {self.cfg.length_condition}")
-
+        """ 
+        
         logits = self.dit(
             x_t, t,
             audio_feats, text_feats,
             ~(audio_mask.bool()), ~(text_mask.bool())
         )
 
-        return logits, length_logits
+        return logits
+    
+    def predict_length_logits(
+        self,
+        x: torch.Tensor,
+        x_mask: torch.Tensor
+    ) -> torch.Tensor:
+        length_logits = self.length_predictor(
+            x, ~(x_mask.bool())
+        )
+        
+        return length_logits
+    
+    def predict_lengths(
+        self,
+        x: torch.Tensor,
+        x_mask: torch.Tensor
+    ) -> torch.Tensor:
+        length_logits = self.length_predictor(
+            x, ~(x_mask.bool())
+        )
+        pred_lengths = length_logits.argmax(dim=-1) 
+        pred_lengths = pred_lengths * (1.0 + self.cfg.length_margin)        
+        pred_lengths = pred_lengths.float().ceil().long()
+        pred_lengths = torch.clamp(pred_lengths, min=1, max=self.cfg.max_target_positions)
+        return pred_lengths
 
 
 if __name__ == "__main__":
@@ -128,7 +162,7 @@ if __name__ == "__main__":
     text_feats = torch.rand((B, T_out * 2, D))
     text_mask = torch.ones(B, T_out * 2).bool()
 
-    logits, length_logits = model(
+    logits = model(
         x_t, t,
         audio_feats, audio_mask,
         text_feats, text_mask
@@ -137,11 +171,36 @@ if __name__ == "__main__":
     print(f"input audio: {audio_feats.shape}")
     print(f"input text: {text_feats.shape}")
     print(f"logits: {logits.shape}")
-    print(f"length_logits: {length_logits.shape}")
+    #print(f"length_logits: {length_logits.shape}")
 
     # test model wrapper
     wrapper = DFMModelWrapper(model)
-    pred_lengths = wrapper.get_length_logits(text_feats, text_mask)
-    print(f"pred_lengths: {pred_lengths.shape}")
+    pred_lengths = wrapper.predict_lengths(text_feats, text_mask)
+    scheduler = PolynomialConvexScheduler(n=2.0)
+    path = MixtureDiscreteProbPath(scheduler=scheduler)
+    solver = MixtureDiscreteEulerSolver(
+        model=wrapper,
+        path=path,
+        vocabulary_size=K,
+    )
+
+    x_0 = torch.randint(0, K, (B, T_out))
+    step_size = 0.1
+    n_step = 10
+    eps = 1e-4
+    time_grid = torch.linspace(0.0, 1.0 - eps, n_step)
+    x_1_hat = solver.sample(
+        x_init=x_0,
+        step_size=step_size,
+        time_grid=time_grid,
+        return_intermediates=True,            
+        audio_feats=audio_feats,
+        text_feats=text_feats,
+        audio_mask=audio_mask,        
+        text_mask=text_mask,
+    )
+    print(f"x_1_hat: {x_1_hat.shape}")
+    print(f"{x_1_hat=}")
+
 
 
