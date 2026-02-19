@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # eval: 34 ~ 35
 # train: 41 ~ 43
 # test: 116 ~ 122 
+SLU_TARGET_KEY="decoupled_normalized_seqlogical"
 
 class HuBERTandDeBERTaDataset(Dataset):
     def __init__(self,
@@ -55,6 +56,7 @@ class HuBERTandDeBERTaDataset(Dataset):
         self.max_text_feat_length = 0
         self.max_text_length = 0
         self.max_gt_length = 0
+        self.max_slu_length = 0
 
         # 디버깅 모드
         self.debugging = debugging
@@ -68,8 +70,10 @@ class HuBERTandDeBERTaDataset(Dataset):
             text_feat_length = data["text_feat_mask"].sum().item()           
             hypothesis = data["greedy_hypothesis"]
             gt = data["ground_truth"]
+            slu = data[SLU_TARGET_KEY]
             text_length = len(self.tokenizer.encode(hypothesis))
             gt_length = len(self.tokenizer.encode(gt))
+            slu_length = len(self.tokenizer.encode(slu))
             
             if self.max_text_feat_length < text_feat_length:
                 self.max_text_feat_length = text_feat_length
@@ -79,11 +83,14 @@ class HuBERTandDeBERTaDataset(Dataset):
                 self.max_text_length = text_length
             if self.max_gt_length < gt_length:
                 self.max_gt_length = gt_length
+            if self.max_slu_length < slu_length:
+                self.max_slu_length = slu_length
             metadata = {"path": path,
                         "audio_length": audio_length,
                         "text_feat_length": text_feat_length,
                         "text_length": text_length,
                         "gt_length": gt_length,
+                        "slu_length": slu_length,
                         "tar_file": None,
                         "tar_member": None}
 
@@ -96,6 +103,7 @@ class HuBERTandDeBERTaDataset(Dataset):
         logger.info(f"{self.max_text_feat_length=}")
         logger.info(f"{self.max_text_length=}")
         logger.info(f"{self.max_gt_length=}")
+        logger.info(f"{self.max_slu_length=}")
         
         # sort by length
         self.metadatas.sort(key=lambda x: x["audio_length"])
@@ -104,8 +112,8 @@ class HuBERTandDeBERTaDataset(Dataset):
         """tar 파일들에서 로드 (메타데이터 자동 캐싱)"""
         # 메타데이터 캐시 파일 경로
         cache_file = os.path.join(tar_dir, f".metadata_cache_{task}.pkl")
-        
-        # 캐시 파일이 있으면 로드
+       
+       # 캐시 파일이 있으면 로드
         if os.path.exists(cache_file):
             logger.info(f"Loading metadata from cache: {cache_file}")
             try:
@@ -116,11 +124,13 @@ class HuBERTandDeBERTaDataset(Dataset):
                     self.max_text_feat_length = cache_data['max_text_feat_length']
                     self.max_text_length = cache_data['max_text_length']
                     self.max_gt_length = cache_data['max_gt_length']
+                    self.max_slu_length = cache_data['max_slu_length']
                 logger.info(f"Loaded {len(self.metadatas)} samples from cache")
                 logger.info(f"{self.max_audio_length=}")
                 logger.info(f"{self.max_text_feat_length=}")
                 logger.info(f"{self.max_text_length=}")
                 logger.info(f"{self.max_gt_length=}")
+                logger.info(f"{self.max_slu_length=}")
                 return
             except Exception as e:
                 logger.warning(f"Failed to load cache: {e}, regenerating...")
@@ -139,6 +149,7 @@ class HuBERTandDeBERTaDataset(Dataset):
         self.max_text_feat_length = 0
         self.max_text_length = 0
         self.max_gt_length = 0
+        self.max_slu_length = 0
         
         idx = 0
         for tar_path in tqdm(tar_files, desc="Loading metadata from tar files"):
@@ -175,8 +186,10 @@ class HuBERTandDeBERTaDataset(Dataset):
                     text_feat_length = data["text_feat_mask"].sum().item()
                     hypothesis = data["greedy_hypothesis"]
                     gt = data["ground_truth"]
+                    slu = data[SLU_TARGET_KEY]
                     text_length = len(self.tokenizer.encode(hypothesis))
                     gt_length = len(self.tokenizer.encode(gt))
+                    slu_length = len(self.tokenizer.encode(slu))
                     
                     if self.max_text_feat_length < text_feat_length:
                         self.max_text_feat_length = text_feat_length
@@ -186,6 +199,8 @@ class HuBERTandDeBERTaDataset(Dataset):
                         self.max_text_length = text_length
                     if self.max_gt_length < gt_length:
                         self.max_gt_length = gt_length
+                    if self.max_slu_length < slu_length:
+                        self.max_slu_length = slu_length
                     
                     metadata = {
                         "path": member.name,
@@ -193,6 +208,7 @@ class HuBERTandDeBERTaDataset(Dataset):
                         "text_feat_length": text_feat_length,
                         "text_length": text_length,
                         "gt_length": gt_length,
+                        "slu_length": slu_length,
                         "tar_file": tar_path,
                         "tar_member": member.name
                     }
@@ -210,6 +226,7 @@ class HuBERTandDeBERTaDataset(Dataset):
         logger.info(f"{self.max_text_feat_length=}")
         logger.info(f"{self.max_text_length=}")
         logger.info(f"{self.max_gt_length=}")
+        logger.info(f"{self.max_slu_length=}")
         
         # sort by length
         self.metadatas.sort(key=lambda x: x["audio_length"])
@@ -222,7 +239,8 @@ class HuBERTandDeBERTaDataset(Dataset):
                 'max_audio_length': self.max_audio_length,
                 'max_text_feat_length': self.max_text_feat_length,
                 'max_text_length': self.max_text_length,
-                'max_gt_length': self.max_gt_length
+                'max_gt_length': self.max_gt_length,
+                'max_slu_length': self.max_slu_length,
             }
             with open(cache_file, 'wb') as f:
                 pickle.dump(cache_data, f)
@@ -283,24 +301,28 @@ class HuBERTandDeBERTaDataset(Dataset):
         feats = data["feats"]
         feat_mask = data["feat_mask"].long()   
         text_feats = data["text_feats"]
-        text_mask = data["text_feat_mask"].long()    
+        text_mask = data["text_feat_mask"].long()   
+        str_slu = data[SLU_TARGET_KEY] 
         str_gts = data["ground_truth"]
         str_hyps = data["greedy_hypothesis"]
                 
+        slu_encoded = self.tokenizer.encode(str_slu)
         gts_encoded = self.tokenizer.encode(str_gts)
-        hyps_encoded = self.tokenizer.encode(str_hyps)        
+        hyps_encoded = self.tokenizer.encode(str_hyps)
+        slus = torch.tensor(slu_encoded).long()        
         gts = torch.tensor(gts_encoded).long()
         hyps = torch.tensor(hyps_encoded).long()
         #make mask
         gt_mask = torch.ones_like(gts).long()
         hyp_mask = torch.ones_like(hyps).long()
+        slu_mask = torch.ones_like(slus).long()
                 
         return (
             feats, feat_mask,
             text_feats, text_mask,
-            gts, hyps,
-            gt_mask, hyp_mask,
-            str_gts, str_hyps,
+            gts, hyps, slus,
+            gt_mask, hyp_mask, slu_mask,
+            str_gts, str_hyps, str_slu,
         )
     
     def __del__(self):
@@ -344,10 +366,13 @@ def hubert_and_deberta_dataset_collate_fn(batch):
         text_mask,          # text feature mask
         gts,                # ground truth
         hyps,               # hypothesis  
+        slus,               # slu label
         gt_mask,            # ground truth mask
         hyp_mask,           # hypothesis mask
+        slu_mask,           # slu mask
         gt_strs,            # ground truth strings
         hyp_strs,           # hypothesis strings
+        slu_strs,           # slu strings
     ) = zip(*batch)
     
     
@@ -358,16 +383,28 @@ def hubert_and_deberta_dataset_collate_fn(batch):
 
     gts_padded = pad_sequence(gts, batch_first=True) # (B, T')
     hyps_padded = pad_sequence(hyps, batch_first=True) # (B, T')
+    slus_padded = pad_sequence(slus, batch_first=True) # (B, T')
     gt_mask_padded = pad_sequence(gt_mask, batch_first=True) # (B, T')
-    hyp_mask_padded = pad_sequence(hyp_mask, batch_first=True) # (B
+    hyp_mask_padded = pad_sequence(hyp_mask, batch_first=True) # (B, T')
+    slu_mask_padded = pad_sequence(slu_mask, batch_first=True) # (B, T')
 
-    return (
-        feats_padded, feat_mask_padded,
-        text_feats_padded, text_mask_padded,
-        gts_padded, hyps_padded,  
-        gt_mask_padded, hyp_mask_padded,
-        gt_strs, hyp_strs,
-    )
+    batch_dict = {
+            "feat": feats_padded,
+            "feat_mask": feat_mask_padded,
+            "text_feat": text_feats_padded,
+            "text_mask": text_mask_padded,
+            "gt": gts_padded,
+            "hyp": hyps_padded,
+            "slu": slus_padded,
+            "gt_mask": gt_mask_padded,
+            "hyp_mask": hyp_mask_padded,
+            "slu_mask": slu_mask_padded,
+            "str_gt": gt_strs,
+            "str_hyp": hyp_strs,
+            "str_slu": slu_strs,
+    }   
+
+    return batch_dict
 
 
 if __name__ == "__main__":
@@ -378,7 +415,7 @@ if __name__ == "__main__":
     processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
 
     # 숫자 추가 지금은 안해도 될 듯??
-    new_tokens = [str(i) for i in range(10)]
+    new_tokens = [str(i) for i in range(10)] +["[MASK]", "[", "]", ":", "_"]
     num_added = processor.tokenizer.add_tokens(new_tokens)
     tokenizer = processor.tokenizer
 
@@ -388,7 +425,7 @@ if __name__ == "__main__":
     logger.info("\n=== Testing with individual files ===")
     mode = "tar" # or "file"
     if mode == "file":
-        dataset = HuBERTandDeBERTaDataset(task="train",
+        dataset = HuBERTandDeBERTaDataset(task="eval_0",
                                           feat_dir="./hubert_deberta_cache_retrial",
                                           tokenizer=tokenizer,                                          
                                           use_tar=False,
@@ -397,8 +434,8 @@ if __name__ == "__main__":
     else:
         # tar 파일 방식 테스트
         logger.info("\n=== Testing with tar files ===")
-        dataset = HuBERTandDeBERTaDataset(task="eval",
-                                          feat_dir="./hubert_deberta_tar",
+        dataset = HuBERTandDeBERTaDataset(task="eval_0",
+                                          feat_dir="../data/slu/hubert_deberta_cache_tar",
                                           tokenizer=tokenizer,                                          
                                           use_tar=True,
                                           debugging=False,
@@ -415,12 +452,43 @@ if __name__ == "__main__":
 
     logger.info(f"\n=== First batch ===")
     batch = next(iter(dataloader))
-    feats, feat_mask, text_feats, text_mask, gts, hyps, gt_mask, hyp_mask, gt_strs, hyp_strs = batch
+    feats = batch["feat"]
+    feat_mask = batch["feat_mask"]
+    text_feats = batch["text_feat"]
+    text_mask = batch["text_mask"]
+    gts = batch["gt"]
+    hyps = batch["hyp"]
+    slus = batch["slu"]
+    gt_mask = batch["gt_mask"]
+    hyp_mask = batch["hyp_mask"]
+    slu_mask = batch["slu_mask"]
+    gt_strs = batch["str_gt"]
+    hyp_strs = batch["str_hyp"]
+    slu_strs = batch["str_slu"]
+
     logger.info(f"feats shape: {feats.shape}")
     logger.info(f"feat_mask shape: {feat_mask.shape}")
     logger.info(f"text_feats shape: {text_feats.shape}")
     logger.info(f"text_mask shape: {text_mask.shape}")
     logger.info(f"gts shape: {gts.shape}")
     logger.info(f"hyps shape: {hyps.shape}")
+    logger.info(f"slus shape: {slus.shape}")
     logger.info(f"gt_strs: {gt_strs}")
     logger.info(f"hyp_strs: {hyp_strs}")
+    logger.info(f"slu_strs: {slu_strs}")
+
+    all_slu_chars = set()
+    for step, batch in enumerate(dataloader):
+        slu = batch["str_slu"]
+        split_slu = [s.split() for s in slu]
+
+        for s in slu:
+            all_slu_chars.update(s)
+
+        if step == 0:
+            print(f"{slu=}")
+            print(f"{split_slu=}")
+
+    sorted_chars = sorted(all_slu_chars)
+    print(f"all_slu_charset_size={len(sorted_chars)}")
+    print(f"all_slu_charset={''.join(sorted_chars)}")

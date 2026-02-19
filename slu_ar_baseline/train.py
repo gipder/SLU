@@ -31,12 +31,13 @@ from flow_matching.utils import ModelWrapper
 from flow_matching.loss import MixturePathGeneralizedKL
 from flow_matching.solver import MixtureDiscreteEulerSolver
 
-from model import DFMModel, DFMModelConfig, DFMModelWrapper
+#from model import DFMModel, DFMModelConfig, DFMModelWrapper
+from model import ARModel, ARModelConfig
 from hubert_deberta_dataset import HuBERTandDeBERTaDataset
 from hubert_deberta_dataset import hubert_and_deberta_dataset_collate_fn
 from hubert_deberta_dataset import BatchSampler
-from sampling import sampling_batch, sampling_debugging
-from custom_path import UniformDiscreteProbPath
+#from sampling import sampling_batch, sampling_debugging
+#from custom_path import UniformDiscreteProbPath
 
 from jiwer import wer
 from utils import str2bool, remove_module_prefix
@@ -44,7 +45,7 @@ from utils import setup_logger, class_name
 
 
 def build_parser():
-    p = argparse.ArgumentParser(description="Train DFM (based on DiT) with HuBERT + DeBERTa features")
+    p = argparse.ArgumentParser(description="Train SLU with HuBERT + DeBERTa features")
 
     # ---- training ----
     p.add_argument("--batch_size", type=int, default=256)    
@@ -61,9 +62,9 @@ def build_parser():
     p.add_argument("--make_model_dir", type=str2bool, default=True, help="Whether to make model save_dir")
     p.add_argument("--reset_save_dir", type=str2bool, default=False, help="Whether to reset save_dir if exists")
     p.add_argument("--save_step", type=int, default=50000, help="Not using currently")
-    p.add_argument("--uniform", type=str2bool, default=False)
-    p.add_argument("--loss_type", type=str,
-                   default="ce", choices=["ce", "gkl"], help="ce or gkl(generalized KL)")    
+    #p.add_argument("--uniform", type=str2bool, default=False)
+    #p.add_argument("--loss_type", type=str,
+    #               default="ce", choices=["ce", "gkl"], help="ce or gkl(generalized KL)")    
     #p.add_argument("--use_additional_loss_only", action="store_true", default=False,
     #               help="For comparison, use only additional loss term")
     p.add_argument("--seed", type=int, default=42)    
@@ -71,31 +72,31 @@ def build_parser():
     p.add_argument("--gpu", type=str, default="0", help="GPU ids separated by comma, e.g., '0,1,2'")
     p.add_argument("--use_tar", type=str2bool, default=True, help="Whether to use tarred dataset")
     # additional loss
-    p.add_argument("--alpha", type=float, default=0.1, help="Weight for additional loss term")    
-    p.add_argument("--use_additional_loss", type=str2bool, default=False,
-                   help="Whether to use additional loss term")
+    #p.add_argument("--alpha", type=float, default=0.1, help="Weight for additional loss term")    
+    #p.add_argument("--use_additional_loss", type=str2bool, default=False,
+    #               help="Whether to use additional loss term")
 
     # ---- model dims / arch ----
     ## for DFM model
-    p.add_argument("--vocab_size", type=int, default=43)
+    p.add_argument("--vocab_size", type=int, default=47)
     p.add_argument("--hidden_size", type=int, default=512)
     p.add_argument("--depth", type=int, default=6)
     p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--audio_dim", type=int, default=1024)
     p.add_argument("--text_dim", type=int, default=1024)
-    p.add_argument("--max_output_length", type=int, default=256, help="Maximum output length during inference")
-    p.add_argument("--noise_ratio", type=float, default=0.5, help="Noise ratio for UniformDiscreteProbPath")
-    p.add_argument("--n_step", type=int, default=5, help="Number of sampling steps during inference")    
-    p.add_argument("--model_type", type=str, choices=["dit", "transformer"], default="dit")
+    p.add_argument("--max_output_length", type=int, default=512, help="Maximum output length during inference")
+    #p.add_argument("--noise_ratio", type=float, default=0.5, help="Noise ratio for UniformDiscreteProbPath")
+    #p.add_argument("--n_step", type=int, default=5, help="Number of sampling steps during inference")    
+    p.add_argument("--model_type", type=str, choices=["dit", "transformer"], default="transformer")
     
     ## for length predictor
-    p.add_argument("--embed_dim", type=int, default=1024)
-    p.add_argument("--length_hidden_dim", type=int, default=512)
-    #p.add_argument("--max_target_positions", type=int, default=256)
-    p.add_argument("--length_dropout", type=float, default=0.1)
-    p.add_argument("--length_condition", type=str, choices=["audio", "text", "both"], default="text")
-    p.add_argument("--length_margin", type=float, default=0.1)
-    p.add_argument("--length_loss_weight", type=float, default=1.0)
+    #p.add_argument("--embed_dim", type=int, default=1024)
+    #p.add_argument("--length_hidden_dim", type=int, default=512)
+    ##p.add_argument("--max_target_positions", type=int, default=256)
+    #p.add_argument("--length_dropout", type=float, default=0.1)
+    #p.add_argument("--length_condition", type=str, choices=["audio", "text", "both"], default="text")
+    #p.add_argument("--length_margin", type=float, default=0.1)
+    #p.add_argument("--length_loss_weight", type=float, default=1.0)
     
 
     # ---- data / tokenization ----, 
@@ -132,7 +133,8 @@ def validate_model(
     eval_dataset,
     tokenizer,
     args,
-    mask_id,
+    sos_id,
+    eos_id,
     device,
     valid_num_samples=2048,
     debugging=False,
@@ -146,9 +148,10 @@ def validate_model(
         eval_dataset: 전체 evaluation dataset
         tokenizer: 토크나이저
         args: 학습 인자
-        mask_id: 마스크 토큰 ID
+        sos_id: 시작 토큰 ID
+        eos_id: 종료 토큰 ID
         device: 학습 device
-        valid_num_samples: validation에 사용할 샘플 개수 (기본값: 2048)
+        num_samples: validation에 사용할 샘플 개수 (기본값: 2048)
         debugging: 디버깅 모드
     
     Returns:
@@ -180,91 +183,55 @@ def validate_model(
         collate_fn=hubert_and_deberta_dataset_collate_fn,
     )
     total_data_samples = len(val_dataset)   
-    wrapper = DFMModelWrapper(model)
-    # a convex path path
-    scheduler = PolynomialConvexScheduler(n=2.0)
-    path = UniformDiscreteProbPath(scheduler=scheduler,
-                                   vocab_size=args.vocab_size,
-                                   noise_ratio=args.noise_ratio)
-
-    solver = MixtureDiscreteEulerSolver(
-        model=wrapper,
-        path=path,
-        vocabulary_size=args.vocab_size,
-    )
-    eps = 1e-4
-    step_size = 0.01
-    n_step = args.n_step
-    time_grid = torch.linspace(0.0, 1.0 - eps, n_step, device=device)
-
-    hyp_ids = []
-    target_ids = []
-    str_asr_hyps = []
-    str_sc_targets = []
-    step = 0
-    count = 0
-    for batch in val_loader:
-        # batch
-        (
-            audio_feats, audio_feat_mask,
-            text_feats, text_feat_mask,
-            gts, hyps,
-            gt_mask, hyp_mask,
-            str_gts, str_hyps,
-        ) = batch
-
-        audio_feats = audio_feats.to(device) # B, T, D
-        audio_feat_mask = audio_feat_mask.to(device)
-        text_feats = text_feats.to(device)
-        text_feat_mask = text_feat_mask.to(device)
-
-        with torch.no_grad():
-            predicted_lengths = model.predict_lengths(
-                text_feats, text_feat_mask.bool()
-            )
-        original_hyp_lengths = hyp_mask.sum(dim=1).to(device)  # B,
-
-        B = audio_feats.size(0)
-        T = max(predicted_lengths.max().item(), original_hyp_lengths.max().item())        
-
-        x_0 = torch.zeros((B, T), device=device, dtype=torch.long)        
-        pos_idx = torch.arange(T, device=device).unsqueeze(0)     # 1, T
-        hyp_mask = pos_idx < original_hyp_lengths.unsqueeze(1)    # B, T
-        hyps_padded = torch.full((B, T), mask_id, device=device, dtype=torch.long)
-        hyps_padded[:, :hyps.size(1)] = hyps
-        x_0[hyp_mask] = hyps_padded[hyp_mask]
-
-        with torch.no_grad():
-            x_1_hat = solver.sample(
-                x_init=x_0,
-                step_size=step_size,
-                time_grid=time_grid,
-                return_intermediates=True,            
-                audio_feats=audio_feats,
-                audio_mask=audio_feat_mask,
-                text_feats=text_feats,
-                text_mask=text_feat_mask,
-            )
-
-        x_1_hat[:, ~hyp_mask] = 0 #blank token for padding positionsq
-        hyp_ids.extend(x_1_hat[-1].cpu().tolist())
-        target_ids.extend(gts.tolist())
-        str_asr_hyps.extend(str_hyps)
-        str_sc_targets.extend(str_gts)
-
-        step += 1
-        count += B
-        
-        if debugging:
-            logger.info(f"{gts=}")
-            logger.info(f"{x_1_hat[-1]=}")
-            logger.info(f"{gts.shape=}")
-            logger.info(f"{x_1_hat[-1].shape=}")
-
-        if step % 10 == 0:
-            logger.info(f"Evaluation step {step:,}/{len(val_loader):,} completed.")
-            logger.info(f"  Processed {count:,}/{total_data_samples:,} samples.")            
     
+    with torch.no_grad():
+        hyp_ids = []
+        target_ids = []
+        str_asr_hyps = []
+        str_slus = []
+        step = 0
+        count = 0
+        for batch in val_loader:
+            audio_feats = batch["feat"]
+            audio_feat_mask = batch["feat_mask"]
+            text_feats = batch["text_feat"]
+            text_feat_mask = batch["text_mask"]
+            slus = batch["slu"]
+            slu_mask = batch["slu_mask"]
+            str_asr_hypothesis = batch["str_hyp"]
+            str_slu_targets = batch["str_slu"]
+            
+            audio_feats = audio_feats.to(device) # B, T, D
+            audio_feat_mask = audio_feat_mask.to(device)
+            text_feats = text_feats.to(device)
+            text_feat_mask = text_feat_mask.to(device)
+            slus = slus.to(device)
+            slu_mask = slu_mask.to(device)
+            
+            generated = model.decode(
+                audio_feats=audio_feats,
+                text_feats=text_feats,
+                audio_mask=audio_feat_mask,
+                text_mask=text_feat_mask,
+                max_output_length=args.max_output_length,
+                sos_id=sos_id,
+                eos_id=eos_id,
+                do_sample=False,
+                device=device,
+            )
+
+            hyp_ids.extend(generated.cpu().tolist())
+            target_ids.extend(slus.cpu().tolist())
+            str_asr_hyps.extend(str_asr_hypothesis)
+            str_slus.extend(str_slu_targets)
+
+            step += 1
+            count += audio_feats.size(0)
+           
+            if step % 10 == 0:
+                logger.info(f"Evaluation step {step:,}/{len(val_loader):,} completed.")
+                logger.info(f"  Processed {count:,}/{total_data_samples:,} samples.")            
+        
     # Decode predictions
     str_hyps = []
     str_targets = []
@@ -275,16 +242,16 @@ def validate_model(
         hyp_id = hyp_ids[b]
         target_id = target_ids[b]        
         str_asr_hyp = str_asr_hyps[b]
-        str_gt = str_sc_targets[b]
+        str_gt = str_slus[b]
         
         hyp = tokenizer.decode(hyp_id, group_tokens=False, skip_special_tokens=True)
         target = tokenizer.decode(target_id, group_tokens=False, skip_special_tokens=True)        
         
         if args.verbose:
-            logger.info(f"GT: {str_gt.split(' ')}")
-            logger.info(f"TARGET: {target.split(' ')}")
+            logger.info(f"SLU GT: {str_gt.split(' ')}")
+            logger.info(f"SLU HYP: {hyp.split(' ')}")
+            logger.info(f"SLU TARGET: {target.split(' ')}")
             logger.info(f"ASR HYP: {str_asr_hyp.split(' ')}")
-            logger.info(f"DFM HYP: {hyp.split(' ')}")
             logger.info("-----")
         
         if hyp == target:
@@ -294,19 +261,19 @@ def validate_model(
         str_targets.append(target)
     
     # Compute metrics
-    dfm_wer = wer(str_targets, str_hyps)
-    asr_wer = wer(str_targets, str_asr_hyps)
-    gt_wer = wer(str_targets, str_sc_targets)
+    slu_wer = wer(str_targets, str_hyps)
+    #asr_wer = wer(str_targets, str_asr_hyps)
+    gt_wer = wer(str_targets, str_slus)
     accuracy = correct_predictions / valid_num_samples_to_use
     
-    logger.info(f"DFM WER: {dfm_wer * 100:.4f}%")
-    logger.info(f"ASR WER: {asr_wer * 100:.4f}%")
+    logger.info(f"SLU WER: {slu_wer * 100:.4f}%")
+    #logger.info(f"ASR WER: {asr_wer * 100:.4f}%")
     logger.info(f"Ground Truth WER: {gt_wer * 100:.4f}%")
     logger.info(f"Exact Matching: {accuracy * 100:.4f}% ({correct_predictions}/{valid_num_samples_to_use})")
     
     return {
-        'dfm_wer': dfm_wer,
-        'asr_wer': asr_wer,
+        'slu_wer': slu_wer,
+        #'asr_wer': asr_wer,
         'gt_wer': gt_wer,
         'accuracy': accuracy,
         'total_samples': valid_num_samples_to_use,
@@ -324,8 +291,9 @@ def train_model(
     eval_dataset,
     optim,
     optim_scheduler,    
-    grad_clip: float = 1.0,    
-    mask_id = 1,
+    grad_clip: float = 1.0,
+    sos_id: int = 1,
+    eos_id: int = 2,    
     tokenizer = None,
     init_condition: Optional[Dict] = None,        
 ):
@@ -347,21 +315,7 @@ def train_model(
     use_cuda = "cuda" in device_str
     scaler = GradScaler(enabled=use_cuda)
     
-    scheduler = PolynomialConvexScheduler(n=2.0)    
-    path = UniformDiscreteProbPath(scheduler=scheduler,
-                                   vocab_size=args.vocab_size,
-                                   noise_ratio=args.noise_ratio)
-
-    length_criterion = nn.CrossEntropyLoss(reduction="mean")
-    if args.loss_type == "ce":
-        criterion = nn.CrossEntropyLoss(reduction="none")
-    elif args.loss_type == "gkl":
-        criterion = MixturePathGeneralizedKL(path)
-    else:
-        raise ValueError(
-            f"Unknown loss_type: {args.loss_type}. "
-            "Supported loss types are: ['ce', 'gkl']"
-        )
+    criterion = nn.CrossEntropyLoss(reduction="none")
     
     loss_ema = None
     ema_beta = getattr(args, "loss_ema_beta", 0.98)
@@ -376,112 +330,58 @@ def train_model(
         model.train()
         
         for batch in train_loader:
-            # batch
-            (
-                audio_feats, audio_feat_mask,
-                text_feats, text_feat_mask,
-                gts, hyps,
-                gt_mask, hyp_mask,
-                str_gts, str_hyps,
-            ) = batch
-
+            audio_feats = batch["feat"]
+            audio_feat_mask = batch["feat_mask"]
+            text_feats = batch["text_feat"]
+            text_feat_mask = batch["text_mask"]
+            slus = batch["slu"]
+            slu_mask = batch["slu_mask"]
+                        
             # x1: B, T_o
             # dtype/shape 정리
             audio_feats = audio_feats.to(device) # B, T, D
             audio_feat_mask = audio_feat_mask.to(device)
             text_feats = text_feats.to(device)
             text_feat_mask = text_feat_mask.to(device)
-            #x1 = gts.to(device)
-            #x1_mask = gt_mask.to(device)
-                        
-            optim.zero_grad(set_to_none=True)
-                        
-            # length prediction
-            original_lengths = gt_mask.sum(dim=1).to(device)  # B,
-            original_hyp_lengths = hyp_mask.sum(dim=1).to(device)  # B,
-            
-            # predicted lengths = original length * ( 1 + margin )
-            lengths = original_lengths * (1.0 + args.length_margin) 
-            lengths = lengths.float().ceil().long()
-            lengths = torch.clamp(lengths, min=1, max=args.max_output_length)
-            K = args.vocab_size
-            B = gts.size(0)            
-            T = int(max(lengths.max().item(), original_hyp_lengths.max().item()))
-            
-            # Vectorized approach: much faster than for loops
-            x0 = torch.zeros((B, T), device=device, dtype=torch.long)
-            x1 = torch.zeros((B, T), dtype=torch.long, device=device)
-            
-            # Create position indices for vectorized indexing
-            batch_idx = torch.arange(B, device=device).unsqueeze(1)  # B, 1
-            pos_idx = torch.arange(T, device=device).unsqueeze(0)     # 1, T
-            
-            # For x0: copy from hyps where position < original_hyp_lengths
-            hyp_mask = pos_idx < original_hyp_lengths.unsqueeze(1)    # B, T
-            hyps_padded = torch.full((B, T), mask_id, device=device, dtype=torch.long)
-            hyps_padded[:, :hyps.size(1)] = hyps
-            x0[hyp_mask] = hyps_padded[hyp_mask]
-            
-            # For x1: copy from gts where position < original_lengths
-            gt_mask = pos_idx < original_lengths.unsqueeze(1)         # B, T
-            gts_padded = torch.zeros((B, T), device=device, dtype=torch.long)
-            gts_padded[:, :gts.size(1)] = gts
-            x1[gt_mask] = gts_padded[gt_mask]
 
-            # sample time t ~ Uniform(eps,1)
-            t = torch.rand(B, device=device).clamp(1e-4, 1.0 - 1e-4)
+            B = slus.size(0)
+            lengths = slu_mask.sum(dim=1).to(device)  # B,
+            T = lengths.max().item()  # max target length in the batch
+            input_ids = torch.zeros((B, T+1), device=device, dtype=torch.long)
+            input_ids[:, 1:] = slus
+            input_ids[:, 0] = sos_id
 
-            sample = path.sample(t=t, x_0=x0, x_1=x1)
-            
-            with torch.amp.autocast('cuda', enabled=False):
+            target_ids = torch.zeros((B, T+1), device=device, dtype=torch.long)
+            target_ids[:, :-1] = slus
+            target_ids[torch.arange(B), lengths] = eos_id
+
+            input_mask = input_ids != 0  # B, T_o+1
+
+            with torch.amp.autocast('cuda', enabled=use_cuda):
                 # logits B, T, K
-                logits = model(x_t=sample.x_t,
-                               t=sample.t,
+                logits = model(input_ids=input_ids,
                                audio_feats=audio_feats,
                                audio_mask=audio_feat_mask,
                                text_feats=text_feats,
                                text_mask=text_feat_mask)
-
-                if args.loss_type == "ce":
-                    corrupt_mask = (x1 != sample.x_t)  # B, T_out
-                    logits_perm = logits.permute(0, -1, 1)
-                    dfm_loss = criterion(logits_perm, x1)
-                    mask = corrupt_mask.float()
-                    denom = mask.sum().clamp_min(1.0)
-                    dfm_loss = (dfm_loss * mask).sum() / denom
-                elif args.loss_type == "gkl":
-                    dfm_loss = criterion(logits=logits,
-                                        x_1=sample.x_1,
-                                        x_t=sample.x_t,
-                                        t=sample.t)
-
-                # Additional loss (skip if not enabled)
-                additional_loss = torch.tensor(0.0, device=device)
-                if args.use_additional_loss:
-                    logits_perm = logits.permute(0, -1, 1)  # B, K, T
-                    additional_loss = criterion(logits_perm, x1).mean()                    
-
-                # for length loss
-                if args.length_condition == "text":
-                    length_logits = model.predict_length_logits(
-                        text_feats, text_feat_mask.bool()
-                    )
-                elif args.length_condition == "audio":
-                    length_logits = model.predict_length_logits(
-                        audio_feats, audio_feat_mask.bool()
-                    )
-                length_loss = length_criterion(length_logits, original_lengths)
-
+                
+                logits_perm = logits.permute(0, -1, 1)
+                ar_loss = criterion(logits_perm, target_ids)
+                mask = input_mask.float()
+                denom = mask.sum().clamp_min(1.0)
+                ar_loss = (ar_loss * mask).sum() / denom
+                
             # Final loss combination
-            loss = ( dfm_loss + args.alpha * additional_loss 
-                    + args.length_loss_weight * length_loss
-            )
+            loss = ( ar_loss )
 
+            optim.zero_grad(set_to_none=True)
             prev_scale = scaler.get_scale()
             scaler.scale(loss).backward()
+            
+            grad_norm = None
             if grad_clip is not None:
                 scaler.unscale_(optim)
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
                     grad_clip
                 )
@@ -498,18 +398,16 @@ def train_model(
                 loss_ema = ema_beta * loss_ema + (1.0 - ema_beta) * loss_val        
             
             if step % args.log_step == 0:
+                grad_norm_val = float(grad_norm) if grad_norm is not None else 0.0
                 logger.info(f"[Epoch {epoch}] "
-                        f"[step {step:,}] "
-                        f"lr={optim_scheduler.get_last_lr()[0]:.6f}, "
-                        f"loss={loss_val:.4f}, "
-                        f"loss_ema={loss_ema:.4f}, "
-                        f"dfm_loss={float(dfm_loss.detach().cpu()):.4f}, "
-                        f"length_loss={float(length_loss.detach().cpu()):.4f}, "
-                        f"length_weight={args.length_loss_weight}, "
-                        f"additional_loss={float(additional_loss.detach().cpu()):.4f}, "                        
-                        f"alpha={args.alpha}, "
-                ) 
-
+                            f"[step {step:,}] "
+                            f"lr={optim_scheduler.get_last_lr()[0]:.6f}, "
+                            f"loss={loss_val:.4f}, "
+                            f"loss_ema={loss_ema:.4f}, "
+                            f"ar_loss={ar_loss.item():.4f}, "
+                            f"grad_norm={grad_norm_val:.4f}, "
+                            f"scale={scaler.get_scale():.1f}"
+                            )
             # Increment step counter
             step += 1
 
@@ -525,7 +423,6 @@ def train_model(
                 "optim": optim.state_dict(),
                 "scaler": scaler.state_dict(),
                 "epoch": epoch,
-                "K": K,
             },
             ckpt_path,
         )
@@ -539,7 +436,8 @@ def train_model(
                 eval_dataset=eval_dataset,
                 tokenizer=tokenizer,
                 args=args,
-                mask_id=mask_id,
+                sos_id=sos_id,
+                eos_id=eos_id,
                 device=device,
                 valid_num_samples=args.valid_num_samples,
                 debugging=args.debugging,
@@ -584,7 +482,8 @@ if __name__ == "__main__":
     # tokenizer
     processor = AutoProcessor.from_pretrained(args.tokenizer_model_name)
     # adding numbers from 0 to 9 + "[MASK]" if not already present
-    new_tokens = [str(i) for i in range(10)] + [args.mask_token]
+    additional_tokens = ["[", "]", ":", "_"]
+    new_tokens = [str(i) for i in range(10)] + [args.mask_token] + additional_tokens
     num_added = processor.tokenizer.add_tokens(new_tokens)
     logger.info(f"{num_added} tokens added to the tokenizer.")
     tokenizer = processor.tokenizer
@@ -597,7 +496,7 @@ if __name__ == "__main__":
               f"Using actual vocab size.")
         args.vocab_size = actual_vocab_size
 
-    cfg = DFMModelConfig(
+    cfg = ARModelConfig(
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         depth=args.depth,
@@ -605,23 +504,14 @@ if __name__ == "__main__":
         audio_dim=args.audio_dim,
         text_dim=args.text_dim, 
         max_output_length=args.max_output_length,
-        n_step=args.n_step,           
         model_type=args.model_type,
-        
-        # for length predictor
-        embed_dim=args.embed_dim,
-        length_hidden_dim=args.length_hidden_dim,
-        max_target_positions=args.max_output_length,    
-        length_dropout=args.length_dropout,
-        length_condition=args.length_condition,
-        length_margin=args.length_margin,
     )
 
-    logger.info(f"* DFMConfig: ")
+    logger.info(f"* ARModelConfig: ")
     logger.info(json.dumps(asdict(cfg), indent=2))
     
     #dfm_model = DFMModel(cfg, device=device)
-    model = DFMModel(cfg)
+    model = ARModel(cfg)
     
     if args.ckpt_path is not None:        
         checkpoint = torch.load(args.ckpt_path, map_location=device)
@@ -631,7 +521,7 @@ if __name__ == "__main__":
 
     #logger.info(f"{dfm_model.device=}")
     trainable_params = 0
-    for model_part in [model.dfm_model, model.length_predictor]:
+    for model_part in [model.slu_model]:
         tmp_trainable_params = sum(p.numel() for p in model_part.parameters() if p.requires_grad)
         trainable_params += tmp_trainable_params
         logger.info(f"{class_name(model_part)} Trainable Parameters: {tmp_trainable_params:,}")
@@ -742,6 +632,8 @@ if __name__ == "__main__":
     logger.info(f"* number of total eval data: {total_eval_samples:,}")
     logger.info(f"* Sampling {min(args.valid_num_samples, total_eval_samples):,} samples randomly for each validation.")
 
+    sos_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 2
     mask_id = tokenizer.convert_tokens_to_ids(args.mask_token)
     logger.info(f"* ID of {args.mask_token}: {mask_id}")
 
@@ -752,7 +644,8 @@ if __name__ == "__main__":
         eval_dataset=eval_dataset,
         optim=optim,
         optim_scheduler=optim_scheduler,
-        mask_id=mask_id,
+        sos_id=sos_id,
+        eos_id=eos_id,
         tokenizer=tokenizer,        
         init_condition=init_condition,        
     )

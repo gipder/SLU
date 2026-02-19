@@ -15,30 +15,18 @@ import os
 from jiwer import wer, process_words, process_characters
 
 # my implementation
-from model import DFMModel, DFMModelConfig, DFMModelWrapper
+from model import ARModel, ARModelConfig
 from hubert_deberta_dataset import HuBERTandDeBERTaDataset
 from hubert_deberta_dataset import hubert_and_deberta_dataset_collate_fn
 from hubert_deberta_dataset import BatchSampler
-from sampling import sampling_batch, sampling_debugging
-from utils import compute_wer_cer
+
+# my implementation
+from utils import compute_wer_cer, compute_metrics
 from utils import set_seed, seed_worker
 from utils import setup_logger
-from utils import str2bool
+from utils import str2bool, class_name
 from tqdm import tqdm
 
-# from flow_matching
-from flow_matching.path import MixtureDiscreteProbPath
-from flow_matching.path.path_sample import DiscretePathSample
-from flow_matching.path.scheduler import PolynomialConvexScheduler
-from flow_matching.utils import ModelWrapper
-from flow_matching.loss import MixturePathGeneralizedKL
-from flow_matching.solver import MixtureDiscreteEulerSolver
-# my implementation
-from custom_path import UniformDiscreteProbPath
-from utils import compute_wer_cer
-
-def class_name(obj) -> str:
-    return type(obj).__name__
 
 
 def build_parser():
@@ -47,14 +35,10 @@ def build_parser():
     # ---- evaluation ----
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--log_step", type=int, default=10, help="Logging step interval during training")
-    p.add_argument("--num_workers", type=int, default=4)    
-    p.add_argument("--uniform", type=bool, default=False)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--n_step", type=int, default=5)   
+    p.add_argument("--num_workers", type=int, default=4)        
+    p.add_argument("--seed", type=int, default=42)    
     p.add_argument("--gpu", type=str, default="0",
                    help="GPU ids to use, e.g., '0,1,2'") 
-    p.add_argument("--sampling_method", type=str, 
-                   choices=["basic"], default="basic")
     p.add_argument("--ckpt_path", type=str, default="",
                    help="Path to load checkpoint")
     p.add_argument("--save_dir", type=str, default=None,
@@ -62,21 +46,20 @@ def build_parser():
 
     # ---- model dims / arch ----
     ## for DiT model
-    p.add_argument("--vocab_size", type=int, default=43)
+    p.add_argument("--vocab_size", type=int, default=47)
     p.add_argument("--hidden_size", type=int, default=512)
     p.add_argument("--depth", type=int, default=6)
     p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--audio_dim", type=int, default=1024)
     p.add_argument("--text_dim", type=int, default=1024)
-    p.add_argument("--max_output_length", type=int, default=256)
-    p.add_argument("--noise_ratio", type=float, default=0.5, help="Noise ratio for UniformDiscreteProbPath")
-    p.add_argument("--model_type", type=str, choices=["dit", "transformer"], default="dit")
+    p.add_argument("--max_output_length", type=int, default=512)
+    p.add_argument("--model_type", type=str, choices=["dit", "transformer"], default="transformer")
 
     ## for length predictor
-    p.add_argument("--embed_dim", type=int, default=1024)
-    p.add_argument("--length_hidden_dim", type=int, default=512)        
-    p.add_argument("--length_condition", type=str, choices=["audio", "text", "both"], default="text")
-    p.add_argument("--length_margin", type=float, default=0.1)
+    #p.add_argument("--embed_dim", type=int, default=1024)
+    #p.add_argument("--length_hidden_dim", type=int, default=512)        
+    #p.add_argument("--length_condition", type=str, choices=["audio", "text", "both"], default="text")
+    #p.add_argument("--length_margin", type=float, default=0.1)
 
     # ---- data / tokenization ----
     p.add_argument("--dataset_path", type=str, default="./hubert_deberta_tar")
@@ -104,9 +87,10 @@ def eval_model(
     args: ArgumentParser,
     task: str,
     tokenizer,
-    model: DFMModel,
+    model: ARModel,
     test_loader: DataLoader,
-    mask_id: int,    
+    sos_id: int = 1,
+    eos_id: int = 2,
 ):
     model.eval()
     device = (
@@ -118,125 +102,102 @@ def eval_model(
     total_samples = len(test_loader.dataset)    
 
     with torch.no_grad():
-        wrapper = DFMModelWrapper(model)
-        scheduler = PolynomialConvexScheduler(n=2.0)
-        path = UniformDiscreteProbPath(
-            scheduler=scheduler,
-            vocab_size=args.vocab_size,
-            noise_ratio=args.noise_ratio,
-        )
-
-        solver = MixtureDiscreteEulerSolver(
-            model=wrapper,
-            path=path,
-            vocabulary_size=args.vocab_size,
-        )
-
-        eps = 1e-4
-        step_size = 0.01
-        n_step = args.n_step
-        time_grid = torch.linspace(0.0, 1.0 - eps, n_step, device=device)
-
         hyp_ids = []
         target_ids = []
         str_asr_hyps = []
-        str_sc_targets = []
+        str_asr_gts = []
+        str_slus = []
         step = 0
         count = 0
         for batch in tqdm(test_loader):
-            # batch
-            (
-                audio_feats, audio_feat_mask,
-                text_feats, text_feat_mask,
-                gts, hyps,
-                gt_mask, hyp_mask,
-                str_gts, str_hyps,
-            ) = batch
+            audio_feats = batch["feat"]
+            audio_feat_mask = batch["feat_mask"]
+            text_feats = batch["text_feat"]
+            text_feat_mask = batch["text_mask"]
+            slus = batch["slu"]
+            slu_mask = batch["slu_mask"]
+            str_asr_hypothesis = batch["str_hyp"]
+            str_asr_gt = batch["str_gt"]
+            str_slu_targets = batch["str_slu"]
 
             audio_feats = audio_feats.to(device) # B, T, D
             audio_feat_mask = audio_feat_mask.to(device)
             text_feats = text_feats.to(device)
             text_feat_mask = text_feat_mask.to(device)
+            slus = slus.to(device)
+            slu_mask = slu_mask.to(device)
 
-            predicted_lengths = model.predict_lengths(
-                text_feats, text_feat_mask.bool()
-            )
-            original_hyp_lengths = hyp_mask.sum(dim=1).to(device)  # B,
-            B = audio_feats.size(0)
-            T = max(predicted_lengths.max().item(), original_hyp_lengths.max().item())
-
-            x_0 = torch.zeros((B, T), device=device, dtype=torch.long)        
-            pos_idx = torch.arange(T, device=device).unsqueeze(0)     # 1, T
-            hyp_mask = pos_idx < original_hyp_lengths.unsqueeze(1)    # B, T
-            hyps_padded = torch.full((B, T), mask_id, device=device, dtype=torch.long)
-            hyps_padded[:, :hyps.size(1)] = hyps
-            x_0[hyp_mask] = hyps_padded[hyp_mask]
-
-            x_1_hat = solver.sample(
-                x_init=x_0,
-                step_size=step_size,
-                time_grid=time_grid,
-                return_intermediates=True,            
+            generated = model.decode(
                 audio_feats=audio_feats,
-                audio_mask=audio_feat_mask,
                 text_feats=text_feats,
+                audio_mask=audio_feat_mask,
                 text_mask=text_feat_mask,
+                max_output_length=args.max_output_length,
+                sos_id=sos_id,
+                eos_id=eos_id,
+                do_sample=False,
+                device=device,
             )
 
-            x_1_hat[:, ~hyp_mask] = 0 #blank token for padding positionsq
-            hyp_ids.extend(x_1_hat[-1].cpu().tolist())
-            target_ids.extend(gts.tolist())
-            str_asr_hyps.extend(str_hyps)
-            str_sc_targets.extend(str_gts)
+            hyp_ids.extend(generated.cpu().tolist())
+            target_ids.extend(slus.cpu().tolist())
+            str_asr_hyps.extend(str_asr_hypothesis)
+            str_asr_gts.extend(str_asr_gt)
+            str_slus.extend(str_slu_targets)
 
             step += 1
-            count += B
+            count += audio_feats.size(0)
 
             if args.debugging:
-                logger.info(f"{gts=}")
-                logger.info(f"{x_1_hat[-1]=}")
-                logger.info(f"{gts.shape=}")
-                logger.info(f"{x_1_hat[-1].shape=}")
+                logger.info(f"{slus=}")
+                logger.info(f"{generated=}")
+                logger.info(f"{slus.shape=}")
+                logger.info(f"{generated.shape=}")
             if step % args.log_step == 0:
                 logger.info(f"Evaluation step {step:,}/{len(test_loader):,} completed.")
                 logger.info(f"  Processed {count:,}/{total_samples:,} samples.")            
 
-            
-
     # id to string conversion
     blank_id = tokenizer.pad_token_id    
-    hyp_texts = []
-    ref_texts = []
+    str_hyps = []
+    str_targets = []
     correct_predictions = 0
-    assert len(hyp_ids) == len(target_ids), \
+
+    assert total_samples == len(hyp_ids) == len(target_ids), \
         f"Number of hypotheses ({len(hyp_ids)}) does not match number of targets ({len(target_ids)})"
     for b in range(len(hyp_ids)):
         hyp_id = hyp_ids[b]
         target_id = target_ids[b]
         #str_asr_hyp = str_asr_hyps[b]
+        #str_gt = str_slus
         #str_sc_target = str_sc_targets[b]
         # Remove blank tokens
         hyp_ids_cleaned = [id for id in hyp_id if id != blank_id]
         target_ids_cleaned = [id for id in target_id if id != blank_id]
         
-        hyp_text = tokenizer.decode(hyp_ids_cleaned, group_tokens=False, skip_special_tokens=True)
-        ref_text = tokenizer.decode(target_ids_cleaned, group_tokens=False, skip_special_tokens=True)
+        hyp = tokenizer.decode(hyp_ids_cleaned, group_tokens=False, skip_special_tokens=True)
+        target = tokenizer.decode(target_ids_cleaned, group_tokens=False, skip_special_tokens=True)
         if args.verbose:
-            logger.info(f"Hypothesis: {hyp_text}")
-            logger.info(f"Reference:  {ref_text}")
+            logger.info(f"Hypothesis: {hyp}")
+            logger.info(f"Reference:  {target}")
             logger.info("-----")
-        
-        hyp_texts.append(hyp_text)
-        ref_texts.append(ref_text)
 
-    results = compute_wer_cer(hyp_texts, ref_texts)
-    asr_results = compute_wer_cer(str_asr_hyps, str_sc_targets)        
-    gt_results = compute_wer_cer(ref_texts, str_sc_targets)
+        if hyp == target:
+            correct_predictions += 1
+        
+        str_hyps.append(hyp)
+        str_targets.append(target)
+    results = compute_metrics(str_hyps, str_targets)
+    asr_results = compute_wer_cer(str_asr_hyps, str_asr_gts)        
+    gt_results = compute_wer_cer(str_targets, str_slus)
 
     # compute WER
     #result = {}
     #wer_score = wer(str_targets, str_hyps_decoded)
-    logger.info(f"DFM WER: {results['wer'] * 100:.4f}%")    
+    logger.info(f"SLU WER: {results['wer'] * 100:.4f}%")
+    logger.info(f"SLU SER: {results['ser'] * 100:.4f}%")
+    logger.info(f"SLU EM: {results['em'] * 100:.4f}%")
+    logger.info(f"SLU EM Tree: {results['em_tree'] * 100:.4f}%")
     #result["dfm_wer"] = wer_score
 
     #wer_score = wer(str_targets, str_hyps)
@@ -249,11 +210,11 @@ def eval_model(
 
     # adding senteces for debugging
     results["sentences"] = []
-    for i in range(len(ref_texts)):
+    for i in range(len(str_hyps)):
         results["sentences"].append({
-            "ground_truth": ref_texts[i],
-            "asr_hypothesis": str_asr_hyps[i],
-            "dfm_hypothesis": hyp_texts[i],
+            "ground_truth": str_targets[i],
+            "slu_hypothesis": str_hyps[i],
+            "asr_hypothesis": str_asr_hyps[i],            
         })
         
     return results
@@ -266,7 +227,8 @@ def main(args):
     # tokenizer
     processor = AutoProcessor.from_pretrained(args.tokenizer_model_name)
     # adding numbers from 0 to 9 + "[MASK]" if not already present
-    new_tokens = [str(i) for i in range(10)] + [args.mask_token]
+    additional_tokens = ["[", "]", ":", "_"]
+    new_tokens = [str(i) for i in range(10)] + [args.mask_token] + additional_tokens
     num_added = processor.tokenizer.add_tokens(new_tokens)
     logger.info(f"{num_added} tokens added to the tokenizer.")
     tokenizer = processor.tokenizer
@@ -276,22 +238,21 @@ def main(args):
     assert actual_vocab_size == args.vocab_size, \
         f"Tokenizer vocab size ({actual_vocab_size}) does not match args.vocab_size ({args.vocab_size})"
 
-    cfg = DFMModelConfig(
+    cfg = ARModelConfig(
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         depth=args.depth,
         num_heads=args.num_heads,
         audio_dim=args.audio_dim,
         text_dim=args.text_dim,
-        max_output_length=args.max_output_length,   
-        n_step=args.n_step,     
+        max_output_length=args.max_output_length,           
         model_type=args.model_type,
     )        
 
     logger.info(f"* Model Config: {class_name(cfg)}")
     logger.info(json.dumps(asdict(cfg), indent=2))
     
-    model = DFMModel(cfg)
+    model = ARModel(cfg)
 
     assert os.path.exists(args.ckpt_path), f"Checkpoint path {args.ckpt_path} does not exist."    
     
@@ -301,7 +262,7 @@ def main(args):
     logger.info(f"* Loaded checkpoint from {args.ckpt_path}")
 
     trainable_params = 0
-    for model_part in [model.dfm_model, model.length_predictor]:
+    for model_part in [model.slu_model]:
         tmp_trainable_params = sum(p.numel() for p in model_part.parameters() if p.requires_grad)
         trainable_params += tmp_trainable_params
         logger.info(f"{class_name(model_part)} Trainable Parameters: {tmp_trainable_params:,}")
@@ -338,9 +299,15 @@ def main(args):
 
     MASK = args.mask_token
     mask_id = tokenizer.convert_tokens_to_ids(MASK)
+    sos_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 2
     logger.info(f"Mask token: '{MASK}' (ID: {mask_id})")
+    logger.info(f"SOS token ID: {sos_id}")
+    logger.info(f"EOS token ID: {eos_id}")
 
-    dfm_wers = []    
+    slu_wers = []    
+    slu_ems = []
+    slu_em_trees = []
     asr_wers = []
     gt_wers = []
     for task in args.test_task:
@@ -372,9 +339,12 @@ def main(args):
             tokenizer=tokenizer,
             model=model,
             test_loader=test_dl,
-            mask_id=mask_id,            
+            sos_id=sos_id,
+            eos_id=eos_id,
         )
-        dfm_wers.append(results["wer"])
+        slu_wers.append(results["wer"])
+        slu_ems.append(results["em"])
+        slu_em_trees.append(results["em_tree"])
         asr_wers.append(results["asr_wer"])
         gt_wers.append(results["gt_wer"])        
 
@@ -395,18 +365,34 @@ def main(args):
         model_name = os.path.basename(args.ckpt_path).replace(".pt", "").replace(".pth", "")
         results_path = os.path.join(
             args.save_dir,
-            f"{task}_{model_name}_n-step{args.n_step}_{time_id}_eval_results.json",
+            f"{task}_{model_name}_{time_id}_eval_summary.json",
         )
+        
+        # Separate sentences from results
+        sentences = results.pop("sentences", [])
+        
+        # Save main results
         with open(results_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=4)
-        logger.info(f"Saved evaluation results to {results_path}")    
+        logger.info(f"Saved evaluation results to {results_path}")
+        
+        # Save sentences to separate file
+        sentences_path = os.path.join(
+            args.save_dir,
+            f"{task}_{model_name}_{time_id}_eval_sentences.json",
+        )
+        with open(sentences_path, "w", encoding="utf-8") as f:
+            json.dump(sentences, f, indent=4)
+        logger.info(f"Saved sentences to {sentences_path}")    
 
     logger.info("=" * 60)
     logger.info(f"{os.path.basename(args.ckpt_path)} EVALUATION SUMMARY")
     logger.info("-" * 60)
     for i, task in enumerate(args.test_task):    
         logger.info(f"Total samples in {task} set: {results['num_sentences']}")    
-        logger.info(f"{task} DFM WER: {dfm_wers[i] * 100:.4f}%")
+        logger.info(f"{task} SLU WER: {slu_wers[i] * 100:.4f}%")        
+        logger.info(f"{task} SLU EM: {slu_ems[i] * 100:.4f}%")
+        logger.info(f"{task} SLU EM Tree: {slu_em_trees[i] * 100:.4f}%")
         logger.info(f"{task} ASR WER: {asr_wers[i] * 100:.4f}%")        
         logger.info(f"{task} GT WER: {gt_wers[i] * 100:.4f}%")
         logger.info("-" * 60)    
@@ -429,7 +415,7 @@ if __name__ == "__main__":
     logger.info("Command line: " + " ".join(sys.argv))
     logger.info(f"Evaluation logs will be saved to {args.save_dir}" )
     logger.info("Arguments:")
-    logger.info(json.dumps(vars(args), indent=2))              z
+    logger.info(json.dumps(vars(args), indent=2))
 
     set_seed(args.seed)    
 
