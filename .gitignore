@@ -3,3 +3,7 @@ garbage*
 __pycache__
 ctc_config.yaml
 .vscode
+example
+my_example
+exp
+*/**/*.pt
