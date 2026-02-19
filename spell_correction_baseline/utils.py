@@ -186,9 +186,11 @@ def compute_wer_cer(text_hyps_list, text_targets_list):
         Dictionary containing:
             - wer: Word Error Rate (0-1)
             - cer: Character Error Rate (0-1)
+            - ser: Sentence Error Rate (0-1)
             - num_sentences: Total number of sentences
             - wer_details: Dict with 'hits', 'substitutions', 'deletions', 'insertions'
             - cer_details: Dict with 'hits', 'substitutions', 'deletions', 'insertions'
+            - ser_details: Dict with 'correct', 'incorrect'
     """
     
     assert len(text_hyps_list) == len(text_targets_list), "Length mismatch between hyps and targets"
@@ -196,107 +198,130 @@ def compute_wer_cer(text_hyps_list, text_targets_list):
     word_measures = process_words(text_targets_list, text_hyps_list)
     character_measures = process_characters(text_targets_list, text_hyps_list)    
     
+    num_sentences = len(text_targets_list)
+    correct_sentences = sum(
+        1 for hyp, target in zip(text_hyps_list, text_targets_list) if hyp == target
+    )
+    incorrect_sentences = num_sentences - correct_sentences
+    ser = 0.0 if num_sentences == 0 else (incorrect_sentences / num_sentences)
+
     results = {
-        'num_sentences': len(text_targets_list),
+        'num_sentences': num_sentences,
         'wer': word_measures.wer,
         'cer': character_measures.cer,
-        'wer_details': {            
+        'ser': ser,
+        'wer_details': {
             'hits': word_measures.hits,
             'substitutions': word_measures.substitutions,
             'deletions': word_measures.deletions,
             'insertions': word_measures.insertions,
         },
-        'cer_details': {            
+        'cer_details': {
             'hits': character_measures.hits,
             'substitutions': character_measures.substitutions,
             'deletions': character_measures.deletions,
             'insertions': character_measures.insertions,
-        }
+        },
+        'ser_details': {
+            'correct': correct_sentences,
+            'incorrect': incorrect_sentences,
+        },
     }
 
     return results
 
-'''
-def compute_wer_cer(hyps_list, targets_list, tokenizer, blank_id, verbose=False):
+
+def compute_metrics(text_hyps_list, text_targets_list):
     """
-    Compute WER (Word Error Rate) and CER (Character Error Rate) using jiwer.
+    Compute comprehensive metrics including WER, CER, SER, and EM (Exact Match) Tree.
+    Following META's standard evaluation approach.
     
     Args:
-        hyps_list: List of hypothesis token ID lists
-        targets_list: List of target token ID lists
-        tokenizer: SentencePiece tokenizer
-        blank_id: ID of blank token
-        verbose: If True, print each hypothesis and reference
-        
+        text_hyps_list: List of hypothesis strings
+        text_targets_list: List of target/reference strings
+                
     Returns:
         Dictionary containing:
             - wer: Word Error Rate (0-1)
             - cer: Character Error Rate (0-1)
+            - ser: Sentence Error Rate (0-1)
+            - em: Exact Match Rate (0-1) - overall accuracy
+            - em_tree: Tree-level exact match (token-level structure match)
             - num_sentences: Total number of sentences
-            - wer_details: Dict with 'hits', 'substitutions', 'deletions', 'insertions'
-            - cer_details: Dict with 'hits', 'substitutions', 'deletions', 'insertions'
+            - wer_details: Detailed WER metrics
+            - cer_details: Detailed CER metrics
+            - ser_details: Detailed SER metrics
+            - em_details: Detailed EM metrics
     """
-    hyp_texts = []
-    ref_texts = []
-
-    for hyp_ids, target_ids in zip(hyps_list, targets_list):
-        # Remove blank tokens
-        hyp_ids_cleaned = [id for id in hyp_ids if id != blank_id]
-        target_ids_cleaned = [id for id in target_ids if id != blank_id]
-        
-        # Remove consecutive duplicates (CTC collapse)
-        dedup_hyp_ids = []
-        prev_id = None
-        for id in hyp_ids_cleaned:
-            if id != prev_id:
-                dedup_hyp_ids.append(id)
-                prev_id = id
-        
-        dedup_target_ids = []
-        prev_id = None
-        for id in target_ids_cleaned:
-            if id != prev_id:
-                dedup_target_ids.append(id)
-                prev_id = id
-        
-        # Decode to text
-        # check if tokenizer is SentencePiece or other
-        # SentencePiece tokenizer has decode_ids method
-        if hasattr(tokenizer, 'decode_ids'):
-            hyp_text = tokenizer.decode_ids(dedup_hyp_ids)
-            ref_text = tokenizer.decode_ids(dedup_target_ids)
-        else:
-            hyp_text = tokenizer.decode(dedup_hyp_ids, skip_special_tokens=True)
-            ref_text = tokenizer.decode(dedup_target_ids, skip_special_tokens=True)
-        if verbose:
-            logger.info(f"Hypothesis: {hyp_text}")
-            logger.info(f"Reference:  {ref_text}")
-            logger.info("-----")
-        
-        hyp_texts.append(hyp_text)
-        ref_texts.append(ref_text)
     
-    # Compute detailed metrics using jiwer.compute_measures
-    word_measures = process_words(ref_texts, hyp_texts)
-    character_measures = process_characters(ref_texts, hyp_texts)    
+    assert len(text_hyps_list) == len(text_targets_list), "Length mismatch between hyps and targets"
+    
+    # Compute WER and CER using jiwer
+    word_measures = process_words(text_targets_list, text_hyps_list)
+    character_measures = process_characters(text_targets_list, text_hyps_list)    
+    
+    num_sentences = len(text_targets_list)
+    
+    # Compute Sentence-level metrics
+    exact_matches = 0
+    tree_matches = 0
+    
+    for hyp, target in zip(text_hyps_list, text_targets_list):
+        # Exact Match: entire sentence must match
+        if hyp == target:
+            exact_matches += 1
+        
+        # Tree Match: tokenized comparison (META style - token-level structure match)
+        hyp_tokens = hyp.split()
+        target_tokens = target.split()
+        
+        # Tree match if same tokens in same order (accounting for minor variations)
+        if hyp_tokens == target_tokens:
+            tree_matches += 1
+    
+    em = 0.0 if num_sentences == 0 else (exact_matches / num_sentences)
+    em_tree = 0.0 if num_sentences == 0 else (tree_matches / num_sentences)
+    ser = 0.0 if num_sentences == 0 else ((num_sentences - exact_matches) / num_sentences)
     
     results = {
-        'num_sentences': len(ref_texts),
+        'num_sentences': num_sentences,
         'wer': word_measures.wer,
         'cer': character_measures.cer,
-        'wer_details': {            
+        'ser': ser,
+        'em': em,
+        'em_tree': em_tree,
+        'wer_details': {
             'hits': word_measures.hits,
             'substitutions': word_measures.substitutions,
             'deletions': word_measures.deletions,
             'insertions': word_measures.insertions,
         },
-        'cer_details': {            
+        'cer_details': {
             'hits': character_measures.hits,
             'substitutions': character_measures.substitutions,
             'deletions': character_measures.deletions,
             'insertions': character_measures.insertions,
-        }
+        },
+        'ser_details': {
+            'correct': exact_matches,
+            'incorrect': num_sentences - exact_matches,
+        },
+        'em_details': {
+            'exact_matches': exact_matches,
+            'tree_matches': tree_matches,
+            'total': num_sentences,
+        },
     }
 
     return results
-'''
+
+
+def class_name(obj) -> str:
+    """
+    Docstring for class_name
+    
+    :param obj: Description
+    :return: Description
+    :rtype: str
+    """
+    return type(obj).__name__
