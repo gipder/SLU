@@ -138,7 +138,7 @@ def validate_model(
     eos_id,
     device,
     valid_num_samples=2048,
-    debugging=False,
+    epoch=None,    
 ):
     """
     Validation 수행 및 메트릭 계산
@@ -267,10 +267,13 @@ def validate_model(
     gt_wer = wer(str_targets, str_slus)
     accuracy = correct_predictions / valid_num_samples_to_use
     
-    logger.info(f"SLU WER: {slu_wer * 100:.4f}%")
-    #logger.info(f"ASR WER: {asr_wer * 100:.4f}%")
-    logger.info(f"Ground Truth WER: {gt_wer * 100:.4f}%")
-    logger.info(f"Exact Matching: {accuracy * 100:.4f}% ({correct_predictions}/{valid_num_samples_to_use})")
+    if epoch is None:
+        epoch_info = ""
+    else:
+        epoch_info = f" at epoch {epoch}"
+    logger.info(f"SLU WER{epoch_info}: {slu_wer * 100:.4f}%")    
+    logger.info(f"Ground Truth WER{epoch_info}: {gt_wer * 100:.4f}%")
+    logger.info(f"Exact Matching{epoch_info}: {accuracy * 100:.4f}% ({correct_predictions}/{valid_num_samples_to_use})")
     
     return {
         'slu_wer': slu_wer,
@@ -441,7 +444,7 @@ def train_model(
                 eos_id=eos_id,
                 device=device,
                 valid_num_samples=args.valid_num_samples,
-                debugging=args.debugging,
+                epoch=epoch,                
             )        
 
     return
