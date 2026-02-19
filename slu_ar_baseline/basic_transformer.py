@@ -28,6 +28,10 @@ class BasicTransformer(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.depth = depth
+
         self.token_emb = nn.Embedding(vocab_size, hidden_size)
         self.pos_emb = nn.Parameter(torch.zeros(1, max_output_length, hidden_size))
 
@@ -144,11 +148,10 @@ class BasicTransformer(nn.Module):
         text_mask: Optional[torch.Tensor] = None,
         max_output_length: Optional[int] = None,
         sos_id: int = 1,
-        eos_id: Optional[int] = 2,
-        do_sample: bool = False,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        device: Optional[torch.device] = None,
+        eos_id: int = 2,
+        use_cache: bool = True,
+        #use_amp: bool = False,        
+        device: Optional[torch.device] = None,        
     ) -> torch.Tensor:
         """
         Autoregressive decoding.
@@ -190,55 +193,137 @@ class BasicTransformer(nn.Module):
 
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
+        kv_cache = None
+        if use_cache:
+            # Transformer KV 캐시 초기화
+            # 각 layer에서 self-attention K/V를 저장
+            head_dim = self.hidden_size // self.num_heads
+            cache_dtype = self.token_emb.weight.dtype
+            kv_cache = {
+                'k': [torch.zeros(batch_size, 0, self.num_heads, head_dim, device=device, dtype=cache_dtype)
+                        for _ in range(self.depth)],
+                'v': [torch.zeros(batch_size, 0, self.num_heads, head_dim, device=device, dtype=cache_dtype)
+                        for _ in range(self.depth)],
+            }
+        """
+        autocast_ctx = torch.amp.autocast(
+            device_type=device.type,
+            enabled=use_amp and device.type == "cuda" and not self.use_mamba,
+        )
+        """        
         for _ in range(max_output_length - 1):
             seq_len = generated.size(1)
             if seq_len > self.pos_emb.size(1):
                 break
 
             x = self.token_emb(generated) + self.pos_emb[:, :seq_len, :]
-            tgt_mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1
-            )
 
-            decoded = self.decoder(
-                tgt=x,
-                memory=memory,
-                tgt_mask=tgt_mask,
-                memory_key_padding_mask=memory_key_padding_mask,
-            )
-            logits = self.head(decoded)[:, -1, :]
+            if use_cache:
+                for layer_idx, layer in enumerate(self.decoder.layers):
+                    # Self-attention with KV cache
+                    q = x
+                    # 이전 K, V를 불러옴
+                    prev_k = kv_cache['k'][layer_idx]  # [batch, prev_seq, heads, head_dim]
+                    prev_v = kv_cache['v'][layer_idx]
 
-            if do_sample:
-                if temperature <= 0:
-                    raise ValueError("temperature must be > 0 when sampling")
-                logits = logits / temperature
-                if top_k is not None and top_k > 0:
-                    top_k = min(top_k, logits.size(-1))
-                    values, indices = torch.topk(logits, top_k, dim=-1)
-                    probs = torch.softmax(values, dim=-1)
-                    next_tokens = indices.gather(
-                        -1, torch.multinomial(probs, num_samples=1)
-                    )
-                else:
-                    probs = torch.softmax(logits, dim=-1)
-                    next_tokens = torch.multinomial(probs, num_samples=1)
+                    # 현재 토큰의 K, V 계산
+                    curr_k, curr_v = self._compute_kv(x, layer.self_attn)
+
+                    # K, V 캐시 업데이트 (이전 + 현재)
+                    k_full = torch.cat([prev_k, curr_k], dim=1) if prev_k.shape[1] > 0 else curr_k
+                    v_full = torch.cat([prev_v, curr_v], dim=1) if prev_v.shape[1] > 0 else curr_v
+
+                    kv_cache['k'][layer_idx] = k_full
+                    kv_cache['v'][layer_idx] = v_full
+
+                    # Self-attention (Q=현재, K,V=캐시된 전체)
+                    self_attn_out = self._multihead_attention(
+                        q, k_full, v_full, layer.self_attn, need_weights=False
+                    )[0]
+                    x = layer.norm1(x + layer.dropout1(self_attn_out))
+
+                    # Cross-attention
+                    cross_attn_out = layer.multihead_attn(
+                        x, memory, memory, key_padding_mask=memory_key_padding_mask, need_weights=False
+                    )[0]
+                    x = layer.norm2(x + layer.dropout2(cross_attn_out))
+
+                    # Feed-forward
+                    ff_out = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
+                    x = layer.norm3(x + layer.dropout3(ff_out))
+                x = self.decoder.norm(x)
             else:
-                next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
-
-            next_tokens = torch.where(finished.unsqueeze(1), torch.full_like(next_tokens, eos_id), next_tokens)
-            generated = torch.cat([generated, next_tokens], dim=1)
-            finished = finished | (next_tokens.squeeze(1) == eos_id)
-
-            if torch.all(finished):
-                break
-            """
-            if eos_id is not None:
-                if torch.all(next_tokens.squeeze(1) == eos_id):
-                    break
-            """
+                tgt_mask = torch.triu(
+                    torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1
+                )
+                x = self.decoder(x, memory, tgt_mask=tgt_mask, memory_key_padding_mask=memory_key_padding_mask)
+            
+            x = x[:, -1:]  # 마지막 토큰의 출력만 사용
+        
+            logits = self.head(x.squeeze(1))
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            
+            next_token = torch.where(finished.unsqueeze(1), eos_id, next_token)
+            generated = torch.cat([generated, next_token], dim=1)
+            finished |= (next_token.squeeze(1) == eos_id)
+            if finished.all(): break
 
         return generated
 
+    def _compute_kv(self, x, attention_module):
+        """입력 x로부터 K, V 계산"""
+        # MultiheadAttention의 in_proj를 사용하여 K, V 계산
+        batch_size, seq_len, d_model = x.shape
+        head_dim = self.hidden_size // self.num_heads
+        
+        # in_proj_weight: [3*d_model, d_model] -> [Q, K, V]
+        w_q, w_k, w_v = attention_module.in_proj_weight.chunk(3)
+        
+        k = torch.nn.functional.linear(x, w_k, attention_module.in_proj_bias.chunk(3)[1] if attention_module.in_proj_bias is not None else None)
+        v = torch.nn.functional.linear(x, w_v, attention_module.in_proj_bias.chunk(3)[2] if attention_module.in_proj_bias is not None else None)
+        
+        # Reshape to [batch, seq, num_heads, head_dim]
+        k = k.view(batch_size, seq_len, self.num_heads, head_dim)
+        v = v.view(batch_size, seq_len, self.num_heads, head_dim)
+        
+        return k, v
+    
+    def _multihead_attention(self, q, k, v, attention_module, need_weights=False):
+        """수동으로 multihead attention 계산 (K, V는 이미 계산된 형태)"""
+        batch_size, q_len, d_model = q.shape
+        _, kv_len, _, head_dim = k.shape
+        
+        # Q 계산
+        w_q = attention_module.in_proj_weight.chunk(3)[0]
+        b_q = attention_module.in_proj_bias.chunk(3)[0] if attention_module.in_proj_bias is not None else None
+        q = torch.nn.functional.linear(q, w_q, b_q)
+        q = q.view(batch_size, q_len, self.num_heads, head_dim).transpose(1, 2)
+        
+        # K, V reshape
+        k = k.transpose(1, 2)  # [batch, heads, kv_len, head_dim]
+        v = v.transpose(1, 2)  # [batch, heads, kv_len, head_dim]
+        
+        # Attention
+        if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False
+            )
+            attn_weights = None
+        else:
+            scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)
+            attn_weights = torch.nn.functional.softmax(scores, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+        
+        # Reshape output
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(batch_size, q_len, d_model)
+        
+        # Output projection
+        attn_output = torch.nn.functional.linear(
+            attn_output, attention_module.out_proj.weight, attention_module.out_proj.bias
+        )
+        
+        return attn_output, attn_weights if need_weights else None
 
 if __name__ == "__main__":
     torch.manual_seed(0)
@@ -289,6 +374,54 @@ if __name__ == "__main__":
         max_output_length=16,
         sos_id=1,
         eos_id=2,
-        do_sample=False,
+        use_cache=False,
     )
     print(f"generated: {generated.shape}")
+
+    MAX_OUTPUT_LENGTH = 1024
+    # Compare use_cache=True vs use_cache=False
+    print("\n" + "="*50)
+    print("Comparing use_cache=True vs use_cache=False")
+    print("="*50)
+    
+    import time
+    
+    # Test with use_cache=False
+    start_time = time.time()
+    generated_no_cache = model.decode(
+        audio_feats=audio_feats,
+        text_feats=text_feats,
+        audio_mask=audio_mask,
+        text_mask=text_mask,
+        max_output_length=MAX_OUTPUT_LENGTH,
+        sos_id=1,
+        eos_id=2,
+        use_cache=False,
+    )
+    time_no_cache = time.time() - start_time
+    print(f"use_cache=False - Time: {time_no_cache:.4f}s, Shape: {generated_no_cache.shape}")
+    
+    # Test with use_cache=True
+    start_time = time.time()
+    generated_with_cache = model.decode(
+        audio_feats=audio_feats,
+        text_feats=text_feats,
+        audio_mask=audio_mask,
+        text_mask=text_mask,
+        max_output_length=MAX_OUTPUT_LENGTH,
+        sos_id=1,
+        eos_id=2,
+        use_cache=True,
+    )
+    time_with_cache = time.time() - start_time
+    print(f"use_cache=True  - Time: {time_with_cache:.4f}s, Shape: {generated_with_cache.shape}")
+    
+    # Calculate speedup
+    speedup = time_no_cache / time_with_cache
+    print(f"\nSpeedup (use_cache=True / use_cache=False): {speedup:.2f}x")
+    print(f"Time saved: {(time_no_cache - time_with_cache):.4f}s ({(1 - time_with_cache/time_no_cache)*100:.1f}%)")
+    
+    # Check if outputs are identical
+    output_match = (generated_no_cache == generated_with_cache).all()
+    print(f"Outputs match: {output_match}")
+    print("="*50 + "\n")
