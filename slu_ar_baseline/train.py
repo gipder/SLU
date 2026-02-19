@@ -88,6 +88,7 @@ def build_parser():
     #p.add_argument("--noise_ratio", type=float, default=0.5, help="Noise ratio for UniformDiscreteProbPath")
     #p.add_argument("--n_step", type=int, default=5, help="Number of sampling steps during inference")    
     p.add_argument("--model_type", type=str, choices=["dit", "transformer"], default="transformer")
+    p.add_argument("--norm_first", type=str2bool, default=True, help="Whether to apply layer normalization before attention and FFN")
     
     ## for length predictor
     #p.add_argument("--embed_dim", type=int, default=1024)
@@ -505,6 +506,7 @@ if __name__ == "__main__":
         text_dim=args.text_dim, 
         max_output_length=args.max_output_length,
         model_type=args.model_type,
+        norm_first=args.norm_first,
     )
 
     logger.info(f"* ARModelConfig: ")

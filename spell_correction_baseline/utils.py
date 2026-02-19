@@ -7,6 +7,7 @@ import argparse
 import logging
 import os
 import time
+import re
 from jiwer import process_words, process_characters
 
 
@@ -174,6 +175,47 @@ def make_gif_from_xts(
 
     raise ValueError("mode must be 'animate' or 'stack'")
 
+def _parse_stop_tree(s: str):
+    """
+    STOP 스타일의 구조화된 출력을 재귀적으로 파싱하여 트리(nested tuple)로 변환.
+    예) "[IN:GET_WEATHER [SL:LOCATION New York ] ]"
+        -> ('IN:GET_WEATHER', [('SL:LOCATION', ['New', 'York'])])
+    공백 차이, 대소문자는 정규화하여 비교에 영향 없게 함.
+    일반 텍스트(구조 없음)는 공백 정규화 후 단순 문자열로 반환.
+    """
+    tokens = s.strip().split()
+
+    def parse(tokens, pos):
+        node = []
+        while pos < len(tokens):
+            tok = tokens[pos]
+            if tok == ']':
+                return node, pos + 1
+            elif tok == '[':
+                pos += 1
+                label = tokens[pos]  # e.g. IN:GET_WEATHER
+                pos += 1
+                children, pos = parse(tokens, pos)
+                node.append((label.upper(), children))
+            else:
+                node.append(tok.lower())
+                pos += 1
+        return node, pos
+
+    # '[' 로 시작하면 트리 구조로 파싱
+    if tokens and tokens[0] == '[':
+        tree, _ = parse(tokens, 0)
+        return tree
+    else:
+        # 일반 텍스트: 공백 정규화
+        return re.sub(r'\s+', ' ', s).strip().lower()
+
+
+def _tree_exact_match(hyp: str, target: str) -> bool:
+    """파싱 트리 기반 exact match. 공백·대소문자 정규화 후 트리 구조 비교."""
+    return _parse_stop_tree(hyp) == _parse_stop_tree(target)
+
+
 def compute_wer_cer(text_hyps_list, text_targets_list):
     """
     Compute WER (Word Error Rate) and CER (Character Error Rate) using jiwer.
@@ -264,23 +306,19 @@ def compute_metrics(text_hyps_list, text_targets_list):
     
     # Compute Sentence-level metrics
     exact_matches = 0
-    tree_matches = 0
+    #tree_matches = 0
     
     for hyp, target in zip(text_hyps_list, text_targets_list):
         # Exact Match: entire sentence must match
         if hyp == target:
             exact_matches += 1
         
-        # Tree Match: tokenized comparison (META style - token-level structure match)
-        hyp_tokens = hyp.split()
-        target_tokens = target.split()
-        
-        # Tree match if same tokens in same order (accounting for minor variations)
-        if hyp_tokens == target_tokens:
-            tree_matches += 1
+        # Tree Match: STOP 스타일 파싱 트리 비교 (공백·대소문자 정규화 포함)
+        #if _tree_exact_match(hyp, target):
+        #    tree_matches += 1
     
     em = 0.0 if num_sentences == 0 else (exact_matches / num_sentences)
-    em_tree = 0.0 if num_sentences == 0 else (tree_matches / num_sentences)
+    #em_tree = 0.0 if num_sentences == 0 else (tree_matches / num_sentences)
     ser = 0.0 if num_sentences == 0 else ((num_sentences - exact_matches) / num_sentences)
     
     results = {
@@ -289,7 +327,7 @@ def compute_metrics(text_hyps_list, text_targets_list):
         'cer': character_measures.cer,
         'ser': ser,
         'em': em,
-        'em_tree': em_tree,
+        #'em_tree': em_tree,
         'wer_details': {
             'hits': word_measures.hits,
             'substitutions': word_measures.substitutions,
@@ -308,7 +346,7 @@ def compute_metrics(text_hyps_list, text_targets_list):
         },
         'em_details': {
             'exact_matches': exact_matches,
-            'tree_matches': tree_matches,
+            #'tree_matches': tree_matches,
             'total': num_sentences,
         },
     }

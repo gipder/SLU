@@ -43,6 +43,7 @@ def build_parser():
                    help="Path to load checkpoint")
     p.add_argument("--save_dir", type=str, default=None,
                    help="Directory to save evaluation logs")
+    p.add_argument("--use_cache", type=str2bool, default=True, help="Whether to use cache during evaluation")
 
     # ---- model dims / arch ----
     ## for DiT model
@@ -54,6 +55,7 @@ def build_parser():
     p.add_argument("--text_dim", type=int, default=1024)
     p.add_argument("--max_output_length", type=int, default=512)
     p.add_argument("--model_type", type=str, choices=["dit", "transformer"], default="transformer")
+    p.add_argument("--norm_first", type=str2bool, default=True, help="Whether to apply layer normalization before attention and FFN")    
 
     ## for length predictor
     #p.add_argument("--embed_dim", type=int, default=1024)
@@ -134,8 +136,8 @@ def eval_model(
                 text_mask=text_feat_mask,
                 max_output_length=args.max_output_length,
                 sos_id=sos_id,
-                eos_id=eos_id,
-                do_sample=False,
+                eos_id=eos_id,  
+                use_cache=args.use_cache,              
                 device=device,
             )
 
@@ -148,7 +150,7 @@ def eval_model(
             step += 1
             count += audio_feats.size(0)
 
-            if args.debugging:
+            if args.verbose:
                 logger.info(f"{slus=}")
                 logger.info(f"{generated=}")
                 logger.info(f"{slus.shape=}")
@@ -156,12 +158,20 @@ def eval_model(
             if step % args.log_step == 0:
                 logger.info(f"Evaluation step {step:,}/{len(test_loader):,} completed.")
                 logger.info(f"  Processed {count:,}/{total_samples:,} samples.")            
+            
+            if args.debugging and count >= args.debugging_num:
+                logger.info(f"Debugging mode: Stopping evaluation after {count} samples.")
+                break
 
     # id to string conversion
     blank_id = tokenizer.pad_token_id    
     str_hyps = []
     str_targets = []
     correct_predictions = 0
+
+    if args.debugging is True:
+        logger.info(f"Total samples in debugging mode: {len(hyp_ids)}")
+        total_samples = args.debugging_num
 
     assert total_samples == len(hyp_ids) == len(target_ids), \
         f"Number of hypotheses ({len(hyp_ids)}) does not match number of targets ({len(target_ids)})"
@@ -197,7 +207,7 @@ def eval_model(
     logger.info(f"SLU WER: {results['wer'] * 100:.4f}%")
     logger.info(f"SLU SER: {results['ser'] * 100:.4f}%")
     logger.info(f"SLU EM: {results['em'] * 100:.4f}%")
-    logger.info(f"SLU EM Tree: {results['em_tree'] * 100:.4f}%")
+    #logger.info(f"SLU EM Tree: {results['em_tree'] * 100:.4f}%")
     #result["dfm_wer"] = wer_score
 
     #wer_score = wer(str_targets, str_hyps)
@@ -247,6 +257,7 @@ def main(args):
         text_dim=args.text_dim,
         max_output_length=args.max_output_length,           
         model_type=args.model_type,
+        norm_first=args.norm_first,
     )        
 
     logger.info(f"* Model Config: {class_name(cfg)}")
@@ -307,7 +318,7 @@ def main(args):
 
     slu_wers = []    
     slu_ems = []
-    slu_em_trees = []
+    #slu_em_trees = []
     asr_wers = []
     gt_wers = []
     for task in args.test_task:
@@ -344,7 +355,7 @@ def main(args):
         )
         slu_wers.append(results["wer"])
         slu_ems.append(results["em"])
-        slu_em_trees.append(results["em_tree"])
+        #slu_em_trees.append(results["em_tree"])
         asr_wers.append(results["asr_wer"])
         gt_wers.append(results["gt_wer"])        
 
@@ -392,7 +403,7 @@ def main(args):
         logger.info(f"Total samples in {task} set: {results['num_sentences']}")    
         logger.info(f"{task} SLU WER: {slu_wers[i] * 100:.4f}%")        
         logger.info(f"{task} SLU EM: {slu_ems[i] * 100:.4f}%")
-        logger.info(f"{task} SLU EM Tree: {slu_em_trees[i] * 100:.4f}%")
+        #logger.info(f"{task} SLU EM Tree: {slu_em_trees[i] * 100:.4f}%")
         logger.info(f"{task} ASR WER: {asr_wers[i] * 100:.4f}%")        
         logger.info(f"{task} GT WER: {gt_wers[i] * 100:.4f}%")
         logger.info("-" * 60)    

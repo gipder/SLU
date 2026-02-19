@@ -25,12 +25,14 @@ class BasicTransformer(nn.Module):
         text_dim: int = 1024,
         max_output_length: int = 256,
         dropout: float = 0.1,
+        norm_first: bool = True,
     ) -> None:
         super().__init__()
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.depth = depth
+        self.norm_first = norm_first
 
         self.token_emb = nn.Embedding(vocab_size, hidden_size)
         self.pos_emb = nn.Parameter(torch.zeros(1, max_output_length, hidden_size))
@@ -45,7 +47,7 @@ class BasicTransformer(nn.Module):
             dim_feedforward=hidden_size * 4,
             dropout=dropout,
             batch_first=True,
-            norm_first=True,  # Use Pre-LN for better stability with deep models
+            norm_first=norm_first,
         )
         self.decoder = nn.TransformerDecoder(
             decoder_layer,
@@ -216,41 +218,70 @@ class BasicTransformer(nn.Module):
             if seq_len > self.pos_emb.size(1):
                 break
 
-            x = self.token_emb(generated) + self.pos_emb[:, :seq_len, :]
+            if use_cache:
+                # 핵심: 마지막 토큰 1개만 임베딩 (incremental decoding)
+                x = self.token_emb(generated[:, -1:]) + self.pos_emb[:, seq_len - 1 : seq_len, :]
+            else:
+                x = self.token_emb(generated) + self.pos_emb[:, :seq_len, :]
 
             if use_cache:
                 for layer_idx, layer in enumerate(self.decoder.layers):
-                    # Self-attention with KV cache
-                    q = x
-                    # 이전 K, V를 불러옴
-                    prev_k = kv_cache['k'][layer_idx]  # [batch, prev_seq, heads, head_dim]
+                    residual = x
+
+                    if self.norm_first:
+                        # Pre-LN: norm → attn → residual
+                        curr_k, curr_v = self._compute_kv(layer.norm1(x), layer.self_attn)
+                    else:
+                        # Post-LN: attn → residual → norm
+                        curr_k, curr_v = self._compute_kv(x, layer.self_attn)
+
+                    # 캐시에 새 토큰의 K, V만 추가
+                    prev_k = kv_cache['k'][layer_idx]
                     prev_v = kv_cache['v'][layer_idx]
-
-                    # 현재 토큰의 K, V 계산
-                    curr_k, curr_v = self._compute_kv(x, layer.self_attn)
-
-                    # K, V 캐시 업데이트 (이전 + 현재)
                     k_full = torch.cat([prev_k, curr_k], dim=1) if prev_k.shape[1] > 0 else curr_k
                     v_full = torch.cat([prev_v, curr_v], dim=1) if prev_v.shape[1] > 0 else curr_v
-
                     kv_cache['k'][layer_idx] = k_full
                     kv_cache['v'][layer_idx] = v_full
 
-                    # Self-attention (Q=현재, K,V=캐시된 전체)
-                    self_attn_out = self._multihead_attention(
-                        q, k_full, v_full, layer.self_attn, need_weights=False
-                    )[0]
-                    x = layer.norm1(x + layer.dropout1(self_attn_out))
+                    if self.norm_first:
+                        # Self-attention (Pre-LN)
+                        self_attn_out = self._multihead_attention(
+                            layer.norm1(x), k_full, v_full, layer.self_attn, need_weights=False
+                        )[0]
+                        x = residual + self_attn_out
 
-                    # Cross-attention
-                    cross_attn_out = layer.multihead_attn(
-                        x, memory, memory, key_padding_mask=memory_key_padding_mask, need_weights=False
-                    )[0]
-                    x = layer.norm2(x + layer.dropout2(cross_attn_out))
+                        # Cross-attention (Pre-LN)
+                        residual = x
+                        cross_attn_out = layer.multihead_attn(
+                            layer.norm2(x), memory, memory,
+                            key_padding_mask=memory_key_padding_mask, need_weights=False
+                        )[0]
+                        x = residual + cross_attn_out
 
-                    # Feed-forward
-                    ff_out = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
-                    x = layer.norm3(x + layer.dropout3(ff_out))
+                        # Feed-forward (Pre-LN)
+                        residual = x
+                        ff_out = layer.linear2(layer.activation(layer.linear1(layer.norm3(x))))
+                        x = residual + ff_out
+                    else:
+                        # Self-attention (Post-LN)
+                        self_attn_out = self._multihead_attention(
+                            x, k_full, v_full, layer.self_attn, need_weights=False
+                        )[0]
+                        x = layer.norm1(residual + self_attn_out)
+
+                        # Cross-attention (Post-LN)
+                        residual = x
+                        cross_attn_out = layer.multihead_attn(
+                            x, memory, memory,
+                            key_padding_mask=memory_key_padding_mask, need_weights=False
+                        )[0]
+                        x = layer.norm2(residual + cross_attn_out)
+
+                        # Feed-forward (Post-LN)
+                        residual = x
+                        ff_out = layer.linear2(layer.activation(layer.linear1(x)))
+                        x = layer.norm3(residual + ff_out)
+
                 x = self.decoder.norm(x)
             else:
                 tgt_mask = torch.triu(

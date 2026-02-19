@@ -11,7 +11,7 @@ import pickle
 import logging
 
 # Setup module-level logger
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 
 # STOP dataset
 # HubertForCTC 모델 기준으로 출력
@@ -106,7 +106,7 @@ class HuBERTandDeBERTaDataset(Dataset):
         logger.info(f"{self.max_slu_length=}")
         
         # sort by length
-        self.metadatas.sort(key=lambda x: x["audio_length"])
+        self.metadatas.sort(key=lambda x: x["slu_length"])
 
     def _load_from_tar(self, tar_dir, task, debugging, debugging_num):
         """tar 파일들에서 로드 (메타데이터 자동 캐싱)"""

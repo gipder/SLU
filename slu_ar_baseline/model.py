@@ -29,6 +29,7 @@ class ARModelConfig:
     sos_token_id: int = 1
     eos_token_id: int = 2
     model_type: str = "transformer"  # "dit" or "transformer"
+    norm_first: bool = True  # Whether to apply layer normalization before attention and FFN
 
 
 class DFMModelWrapper(ModelWrapper):
@@ -121,6 +122,7 @@ class ARModel(nn.Module):
         max_output_length: Optional[int] = None,
         sos_id: int = 1,
         eos_id: Optional[int] = 2,
+        use_cache: bool = True,
         do_sample: bool = False,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
@@ -128,7 +130,7 @@ class ARModel(nn.Module):
     ) -> torch.Tensor:
         return self.slu_model.decode(
             audio_feats, text_feats, ~(audio_mask.bool()), ~(text_mask.bool()),
-            max_output_length, sos_id, eos_id, do_sample, temperature, top_k, device
+            max_output_length, sos_id, eos_id, use_cache=use_cache, device=device
         )               
 
 if __name__ == "__main__":
