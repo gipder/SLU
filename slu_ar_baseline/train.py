@@ -123,10 +123,13 @@ def build_parser():
     p.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
 
     # ---- data augmentation ----
-    p.add_argument("--augment", type=str2bool, default=False, help="Enable feature augmentation")
+    p.add_argument("--use_augment", type=str2bool, default=False, help="Enable feature augmentation")
     p.add_argument("--augment_type", type=str, default="span_mask",
                    help="Augmentation type(s). 단일: 'span_mask' / 조합: 'span_mask,gaussian_noise'")
-    p.add_argument("--augment_noise_std", type=float, default=0.02, help="Std for Gaussian noise")
+    p.add_argument("--augment_audio_noise_std", type=float, default=0.02,
+                   help="Std for Gaussian noise on audio features (HuBERT-large 권장: 0.01~0.05)")
+    p.add_argument("--augment_text_noise_std", type=float, default=0.01,
+                   help="Std for Gaussian noise on text features (DeBERTa 권장: 0.005~0.02)")
     p.add_argument("--augment_noise_schedule", type=str, default="constant",
                    choices=["constant", "linear_increase", "linear_decrease"],
                    help="Schedule for noise std")
@@ -599,7 +602,8 @@ def train_model(
             sos_id=sos_id,
             eos_id=eos_id,
             device=device,
-            epoch=epoch,                
+            epoch=epoch,   
+            criterion=criterion,           
         )        
 
         if valid_loss['valid_loss'] < best_valid_loss:
