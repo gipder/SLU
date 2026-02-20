@@ -125,7 +125,7 @@ def build_parser():
     # ---- data augmentation ----
     p.add_argument("--augment", type=str2bool, default=False, help="Enable feature augmentation")
     p.add_argument("--augment_type", type=str, default="span_mask",
-                   choices=["none", "gaussian_noise", "span_mask"], help="Augmentation type")
+                   help="Augmentation type(s). 단일: 'span_mask' / 조합: 'span_mask,gaussian_noise'")
     p.add_argument("--augment_noise_std", type=float, default=0.02, help="Std for Gaussian noise")
     p.add_argument("--augment_noise_schedule", type=str, default="constant",
                    choices=["constant", "linear_increase", "linear_decrease"],
@@ -174,8 +174,8 @@ def validate_model(
         sos_id: 시작 토큰 ID
         eos_id: 종료 토큰 ID
         device: 학습 device
-        num_samples: validation에 사용할 샘플 개수 (기본값: 2048)
-        debugging: 디버깅 모드
+        valid_num_samples: validation에 사용할 샘플 개수 (기본값: 2048)
+        epoch: 현재 epoch
     
     Returns:
         dict: 'dfm_wer', 'asr_wer', 'gt_wer', 'accuracy' 포함
@@ -307,6 +307,131 @@ def validate_model(
     }
 
 
+def compute_valid_loss(
+    model,
+    eval_dataset,
+    tokenizer,
+    args,
+    sos_id,
+    eos_id,
+    device,
+    epoch=None,
+    criterion=nn.CrossEntropyLoss(reduction="none"),    
+):
+    """
+    Validation 수행 및 메트릭 계산
+    매번 다른 샘플을 무작위로 선택하여 평가
+    
+    Args:
+        model: 평가할 모델
+        eval_dataset: 전체 evaluation dataset
+        tokenizer: 토크나이저
+        args: 학습 인자
+        sos_id: 시작 토큰 ID
+        eos_id: 종료 토큰 ID
+        device: 학습 device        
+        epoch: 현재 epoch
+    
+    Returns:
+        valid_loss 포함
+    """
+    device = (
+        next(model.parameters()).device
+        if not isinstance(model, torch.nn.DataParallel) 
+        else next(model.module.parameters()).device
+    )
+    device_str = str(device)
+    use_cuda = "cuda" in device_str
+
+    model.eval()
+    
+    # 전체 dataset에서 무작위로 num_samples만큼 선택
+    total_samples = len(eval_dataset)        
+    val_dataset = eval_dataset
+    logger.info(f"* Validation: Using all {total_samples:,} samples")
+    
+    # Validation용 DataLoader 생성
+    val_sampler = BatchSampler(val_dataset,
+                               batch_size=args.batch_size,
+                               shuffle=False)
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_sampler=val_sampler,
+        num_workers=args.num_workers,
+        collate_fn=hubert_and_deberta_dataset_collate_fn,
+    )    
+
+    every_n = max(1, len(val_loader) // 4)
+    
+    with torch.no_grad():
+        step = 0
+        count = 0
+        loss_sum = 0.0  # per-token 평균 loss의 배치 합산
+        for batch in val_loader:
+            audio_feats = batch["feat"]
+            audio_feat_mask = batch["feat_mask"]
+            text_feats = batch["text_feat"]
+            text_feat_mask = batch["text_mask"]
+            slus = batch["slu"]
+            slu_mask = batch["slu_mask"]
+            
+            audio_feats = audio_feats.to(device) # B, T, D
+            audio_feat_mask = audio_feat_mask.to(device)
+            text_feats = text_feats.to(device)
+            text_feat_mask = text_feat_mask.to(device)
+            slus = slus.to(device)
+            slu_mask = slu_mask.to(device)
+            
+            B = slus.size(0)
+            lengths = slu_mask.sum(dim=1).to(device)  # B,
+            T = lengths.max().item()  # max target length in the batch
+            input_ids = torch.zeros((B, T+1), device=device, dtype=torch.long)
+            input_ids[:, 1:] = slus
+            input_ids[:, 0] = sos_id
+
+            target_ids = torch.zeros((B, T+1), device=device, dtype=torch.long)
+            target_ids[:, :-1] = slus
+            target_ids[torch.arange(B), lengths] = eos_id
+
+            input_mask = input_ids != 0  # B, T_o+1
+            
+            with torch.amp.autocast('cuda', enabled=use_cuda):
+                # logits B, T, K
+                logits = model(input_ids=input_ids,
+                            audio_feats=audio_feats,
+                            audio_mask=audio_feat_mask,
+                            text_feats=text_feats,
+                            text_mask=text_feat_mask)
+                
+                logits_perm = logits.permute(0, -1, 1)
+                ar_loss = criterion(logits_perm, target_ids)
+                mask = input_mask.float()
+                denom = mask.sum().clamp_min(1.0)
+                # ar_loss: per-token 평균 (단위 일관성 유지)
+                ar_loss = (ar_loss * mask).sum() / denom
+
+            loss_sum += ar_loss.item()
+
+            step += 1
+            count += audio_feats.size(0)
+            """
+            if step % every_n == 0:
+                logger.info(f"Evaluation step {step:,}/{len(val_loader):,} completed.")
+                logger.info(f"  Processed {count:,}/{total_samples:,} samples.")
+            """
+    # 배치 수로 나눠서 per-token 평균의 배치 평균 → ar_loss와 동일한 단위
+    valid_loss = loss_sum / max(1, step)
+
+    if epoch is None:
+        epoch_info = ""
+    else:
+        epoch_info = f" at epoch {epoch}"
+    logger.info(f"Valid loss{epoch_info}: {valid_loss:.4f}")
+
+    return {'valid_loss': valid_loss}
+
+
 # -------------------------
 # Train loop
 # -------------------------
@@ -350,6 +475,7 @@ def train_model(
     step = init_condition.get("step", 1) if init_condition is not None else 1
     init_epoch = init_condition.get("epoch", 1) if init_condition is not None else 1
 
+    best_valid_loss = float("inf")
     for epoch in range(init_epoch, args.final_epoch + 1):        
         logger.info(f"===== Starting epoch {epoch} =====")
         
@@ -451,7 +577,7 @@ def train_model(
         if args.make_model_dir:
             ckpt_path = os.path.join(save_dir, "model", f"model_epoch{epoch}.pt")
         else:
-            ckpt_path = os.path.join(save_dir, f"model_epoch{epoch}.pt")
+            ckpt_path = os.path.join(save_dir, f"model_epoch{epoch}.pt")            
         torch.save(
             {
                 "step": step,
@@ -463,6 +589,29 @@ def train_model(
             ckpt_path,
         )
         logger.info(f"Saved: {ckpt_path}")
+
+        logger.info(f"===== Valid Loss Calculation at epoch {epoch} =====")
+        valid_loss = compute_valid_loss(
+            model=model,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            args=args,
+            sos_id=sos_id,
+            eos_id=eos_id,
+            device=device,
+            epoch=epoch,                
+        )        
+
+        if valid_loss['valid_loss'] < best_valid_loss:
+            best_valid_loss = valid_loss['valid_loss']
+            if args.make_model_dir:
+                best_link = os.path.join(save_dir, "model", "best_valid_model.pt")
+            else:
+                best_link = os.path.join(save_dir, "best_valid_model.pt")
+            if os.path.islink(best_link) or os.path.exists(best_link):
+                os.remove(best_link)
+            os.symlink(os.path.basename(ckpt_path), best_link)
+            logger.info(f"New best valid loss: {best_valid_loss:.4f} -> symlink: {best_link} -> {ckpt_path}")
         
         # Run validation with random sampling
         if epoch % args.eval_epoch == 0:
@@ -477,7 +626,7 @@ def train_model(
                 device=device,
                 valid_num_samples=args.valid_num_samples,
                 epoch=epoch,                
-            )        
+            )
 
     return
 
