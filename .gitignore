@@ -8,3 +8,4 @@ my_example
 exp
 */**/*.pt
 */**/*.log
+*/**/experiment*
