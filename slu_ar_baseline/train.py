@@ -41,6 +41,7 @@ from hubert_deberta_dataset import BatchSampler
 
 from jiwer import wer
 from utils import str2bool, remove_module_prefix
+from augmentation import build_augmentor
 from utils import setup_logger, class_name
 
 
@@ -120,6 +121,27 @@ def build_parser():
 
     # ---- device ----
     p.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
+
+    # ---- data augmentation ----
+    p.add_argument("--augment", type=str2bool, default=False, help="Enable feature augmentation")
+    p.add_argument("--augment_type", type=str, default="span_mask",
+                   choices=["none", "gaussian_noise", "span_mask"], help="Augmentation type")
+    p.add_argument("--augment_noise_std", type=float, default=0.02, help="Std for Gaussian noise")
+    p.add_argument("--augment_noise_schedule", type=str, default="constant",
+                   choices=["constant", "linear_increase", "linear_decrease"],
+                   help="Schedule for noise std")
+    p.add_argument("--augment_noise_schedule_steps", type=int, default=0,
+                   help="Steps for noise schedule (0 = constant)")
+    p.add_argument("--augment_use_layernorm", type=str2bool, default=False,
+                   help="Apply LayerNorm before noise")
+    p.add_argument("--augment_audio_mask_ratio", type=float, default=0.1,
+                   help="Audio span mask ratio (0~1)")
+    p.add_argument("--augment_text_mask_ratio", type=float, default=0.1,
+                   help="Text span mask ratio (0~1)")
+    p.add_argument("--augment_audio_mask_span", type=int, default=10,
+                   help="Audio span length")
+    p.add_argument("--augment_text_mask_span", type=int, default=3,
+                   help="Text span length")
 
     return p
 
@@ -299,6 +321,7 @@ def train_model(
     sos_id: int = 1,
     eos_id: int = 2,    
     tokenizer = None,
+    augmentor = None,
     init_condition: Optional[Dict] = None,        
 ):
     
@@ -347,6 +370,15 @@ def train_model(
             audio_feat_mask = audio_feat_mask.to(device)
             text_feats = text_feats.to(device)
             text_feat_mask = text_feat_mask.to(device)
+
+            if augmentor is not None:
+                audio_feats, text_feats, audio_feat_mask, text_feat_mask = augmentor.apply(
+                    audio_feats=audio_feats,
+                    text_feats=text_feats,
+                    audio_mask=audio_feat_mask,
+                    text_mask=text_feat_mask,
+                    step=step,
+                )
 
             B = slus.size(0)
             lengths = slu_mask.sum(dim=1).to(device)  # B,
@@ -455,9 +487,25 @@ if __name__ == "__main__":
     args = build_parser().parse_args()
 
     # remove save_dir if reset_save_dir is True
-    if args.reset_save_dir and os.path.exists(args.save_dir):        
+    if args.reset_save_dir and os.path.exists(args.save_dir):
         import shutil
-        shutil.rmtree(args.save_dir)
+        existing_ckpts = (
+            glob.glob(os.path.join(args.save_dir, "model_*.pt")) +
+            glob.glob(os.path.join(args.save_dir, "model", "model_*.pt"))
+        )
+        if existing_ckpts:
+            print(f"[WARNING] Found {len(existing_ckpts)} checkpoint(s) in '{args.save_dir}':")
+            for p in sorted(existing_ckpts):
+                print(f"  {p}")
+            answer = input("Delete save_dir and all checkpoints? [y/N] ").strip().lower()
+            if answer == "y":
+                shutil.rmtree(args.save_dir)
+                print(f"Deleted: {args.save_dir}")
+            else:
+                print("Aborted. Keeping existing save_dir.")
+                args.reset_save_dir = False
+        else:
+            shutil.rmtree(args.save_dir)
 
     if args.save_dir is None:
         args.save_dir = "garbage"        
@@ -642,6 +690,9 @@ if __name__ == "__main__":
     mask_id = tokenizer.convert_tokens_to_ids(args.mask_token)
     logger.info(f"* ID of {args.mask_token}: {mask_id}")
 
+    augmentor = build_augmentor(args)
+    logger.info(f"* Augmentor: {class_name(augmentor)}")
+
     train_model(
         args=args,
         model=model,
@@ -652,5 +703,6 @@ if __name__ == "__main__":
         sos_id=sos_id,
         eos_id=eos_id,
         tokenizer=tokenizer,        
+        augmentor=augmentor,
         init_condition=init_condition,        
     )
