@@ -18,7 +18,7 @@ logger = logging.getLogger()
 # Tokenizer: A-Z + blank
 # eval: 34 ~ 35
 # train: 41 ~ 43
-# test: 116 ~ 122 
+# test: 116 ~ 122
 SLU_TARGET_KEY="decoupled_normalized_seqlogical"
 
 class HuBERTandDeBERTaDataset(Dataset):
@@ -27,17 +27,18 @@ class HuBERTandDeBERTaDataset(Dataset):
                  feat_dir="./hubert_deberta_cache_retrial",
                  tokenizer=None,
                  #max_output_length=128,
+                 use_tar=True,
                  debugging=False,
                  debugging_num=128,
-                 use_tar=False):
+                 ):
         self.task = task
         self.use_tar = use_tar
         self.feat_dir = feat_dir
         self.tokenizer = tokenizer
-        
+
         # tar 파일 핸들을 저장할 딕셔너리
         self.tar_files = {}
-        
+
         if use_tar:
             # tar 파일 모드: tar 파일들에서 인덱스 로드 (메타데이터 자동 캐싱)
             self._load_from_tar(feat_dir, task, debugging, debugging_num)
@@ -48,7 +49,7 @@ class HuBERTandDeBERTaDataset(Dataset):
     def _load_from_files(self, feat_dir, task, debugging, debugging_num):
         """기존 방식: 개별 파일들에서 로드"""
         self.file_paths = glob.glob(os.path.join(feat_dir, f"{task}*", "**", "*.pt"), recursive=True)
-        self.metadatas = []        
+        self.metadatas = []
         #self.max_output_length = max_output_length
 
         # 가장 긴 오디오, 텍스트 길이 추적용
@@ -66,15 +67,15 @@ class HuBERTandDeBERTaDataset(Dataset):
         for file in tqdm(self.file_paths, desc="Loading metadata from files"):
             data = torch.load(file, map_location="cpu")
             path = file
-            audio_length = data["feat_mask"].sum().item() 
-            text_feat_length = data["text_feat_mask"].sum().item()           
+            audio_length = data["feat_mask"].sum().item()
+            text_feat_length = data["text_feat_mask"].sum().item()
             hypothesis = data["greedy_hypothesis"]
             gt = data["ground_truth"]
             slu = data[SLU_TARGET_KEY]
             text_length = len(self.tokenizer.encode(hypothesis))
             gt_length = len(self.tokenizer.encode(gt))
             slu_length = len(self.tokenizer.encode(slu))
-            
+
             if self.max_text_feat_length < text_feat_length:
                 self.max_text_feat_length = text_feat_length
             if self.max_audio_length < audio_length:
@@ -104,7 +105,7 @@ class HuBERTandDeBERTaDataset(Dataset):
         logger.info(f"{self.max_text_length=}")
         logger.info(f"{self.max_gt_length=}")
         logger.info(f"{self.max_slu_length=}")
-        
+
         # sort by length
         self.metadatas.sort(key=lambda x: x["slu_length"])
 
@@ -112,7 +113,7 @@ class HuBERTandDeBERTaDataset(Dataset):
         """tar 파일들에서 로드 (메타데이터 자동 캐싱)"""
         # 메타데이터 캐시 파일 경로
         cache_file = os.path.join(tar_dir, f".metadata_cache_{task}.pkl")
-       
+
        # 캐시 파일이 있으면 로드
         if os.path.exists(cache_file):
             logger.info(f"Loading metadata from cache: {cache_file}")
@@ -134,23 +135,23 @@ class HuBERTandDeBERTaDataset(Dataset):
                 return
             except Exception as e:
                 logger.warning(f"Failed to load cache: {e}, regenerating...")
-        
+
         # tar 파일들 찾기 (.tar.gz 파일도 포함)
         tar_pattern = os.path.join(tar_dir, f"{task}*.tar*")
         tar_files = glob.glob(tar_pattern)
-        
+
         if not tar_files:
             raise ValueError(f"No tar files found matching pattern: {tar_pattern}")
-        
+
         logger.info(f"Found {len(tar_files)} tar files, loading metadata (this may take a while)...")
-        
+
         self.metadatas = []
         self.max_audio_length = 0
         self.max_text_feat_length = 0
         self.max_text_length = 0
         self.max_gt_length = 0
         self.max_slu_length = 0
-        
+
         idx = 0
         for tar_path in tqdm(tar_files, desc="Loading metadata from tar files"):
             # tar 파일 열기 (.tar.gz도 자동 지원)
@@ -159,9 +160,9 @@ class HuBERTandDeBERTaDataset(Dataset):
             except Exception as e:
                 logger.error(f"Failed to open tar file {tar_path}: {e}")
                 continue
-                
+
             self.tar_files[tar_path] = tar
-            
+
             # tar 파일 내의 모든 멤버 순회
             for member in tar.getmembers():
                 if member.name.endswith('.pt'):
@@ -171,17 +172,17 @@ class HuBERTandDeBERTaDataset(Dataset):
                         if f is None:
                             logger.warning(f"Member {member.name} in {tar_path} is not a regular file, skipping...")
                             continue
-                        
+
                         file_data = f.read()
                         if not file_data:
                             logger.warning(f"Empty data for member {member.name} in {tar_path}, skipping...")
                             continue
-                            
+
                         data = torch.load(io.BytesIO(file_data), map_location="cpu", weights_only=False)
                     except Exception as e:
                         logger.warning(f"Error loading metadata for {member.name} in {tar_path}: {e}, skipping...")
                         continue
-                    
+
                     audio_length = data["feat_mask"].sum().item()
                     text_feat_length = data["text_feat_mask"].sum().item()
                     hypothesis = data["greedy_hypothesis"]
@@ -190,7 +191,7 @@ class HuBERTandDeBERTaDataset(Dataset):
                     text_length = len(self.tokenizer.encode(hypothesis))
                     gt_length = len(self.tokenizer.encode(gt))
                     slu_length = len(self.tokenizer.encode(slu))
-                    
+
                     if self.max_text_feat_length < text_feat_length:
                         self.max_text_feat_length = text_feat_length
                     if self.max_audio_length < audio_length:
@@ -201,7 +202,7 @@ class HuBERTandDeBERTaDataset(Dataset):
                         self.max_gt_length = gt_length
                     if self.max_slu_length < slu_length:
                         self.max_slu_length = slu_length
-                    
+
                     metadata = {
                         "path": member.name,
                         "audio_length": audio_length,
@@ -212,25 +213,25 @@ class HuBERTandDeBERTaDataset(Dataset):
                         "tar_file": tar_path,
                         "tar_member": member.name
                     }
-                    
+
                     self.metadatas.append(metadata)
                     idx += 1
-                    
+
                     if debugging and idx >= debugging_num:
                         break
-            
+
             if debugging and idx >= debugging_num:
                 break
-        
+
         logger.info(f"{self.max_audio_length=}")
         logger.info(f"{self.max_text_feat_length=}")
         logger.info(f"{self.max_text_length=}")
         logger.info(f"{self.max_gt_length=}")
         logger.info(f"{self.max_slu_length=}")
-        
+
         # sort by length
         self.metadatas.sort(key=lambda x: x["audio_length"])
-        
+
         # 메타데이터 캐싱 (항상 저장)
         logger.info(f"Saving metadata cache to {cache_file}...")
         try:
@@ -253,16 +254,16 @@ class HuBERTandDeBERTaDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.metadatas[idx]
-        
+
         if self.use_tar:
             # tar 파일에서 읽기
             tar_path = item["tar_file"]
             member_name = item["tar_member"]
-            
+
             # tar 파일이 열려있지 않으면 열기
             if tar_path not in self.tar_files:
                 self.tar_files[tar_path] = tarfile.open(tar_path, 'r:*')
-            
+
             tar = self.tar_files[tar_path]
             try:
                 member = tar.getmember(member_name)
@@ -282,7 +283,7 @@ class HuBERTandDeBERTaDataset(Dataset):
                     pass
                 del self.tar_files[tar_path]
                 self.tar_files[tar_path] = tarfile.open(tar_path, 'r:*')
-                
+
                 tar = self.tar_files[tar_path]
                 member = tar.getmember(member_name)
                 f = tar.extractfile(member)
@@ -296,27 +297,27 @@ class HuBERTandDeBERTaDataset(Dataset):
             # 개별 파일에서 읽기
             path = item["path"]
             data = torch.load(path, map_location="cpu")
-        
+
         # audio_feat, audio_feat_mask, text_feat, text_feat_mask, gt, hyp, slu
         feats = data["feats"]
-        feat_mask = data["feat_mask"].long()   
+        feat_mask = data["feat_mask"].long()
         text_feats = data["text_feats"]
-        text_mask = data["text_feat_mask"].long()   
-        str_slu = data[SLU_TARGET_KEY] 
+        text_mask = data["text_feat_mask"].long()
+        str_slu = data[SLU_TARGET_KEY]
         str_gts = data["ground_truth"]
         str_hyps = data["greedy_hypothesis"]
-                
+
         slu_encoded = self.tokenizer.encode(str_slu)
         gts_encoded = self.tokenizer.encode(str_gts)
         hyps_encoded = self.tokenizer.encode(str_hyps)
-        slus = torch.tensor(slu_encoded).long()        
+        slus = torch.tensor(slu_encoded).long()
         gts = torch.tensor(gts_encoded).long()
         hyps = torch.tensor(hyps_encoded).long()
         #make mask
         gt_mask = torch.ones_like(gts).long()
         hyp_mask = torch.ones_like(hyps).long()
         slu_mask = torch.ones_like(slus).long()
-                
+
         return (
             feats, feat_mask,
             text_feats, text_mask,
@@ -324,7 +325,7 @@ class HuBERTandDeBERTaDataset(Dataset):
             gt_mask, hyp_mask, slu_mask,
             str_gts, str_hyps, str_slu,
         )
-    
+
     def __del__(self):
         """소멸자: 열린 tar 파일들 닫기"""
         if hasattr(self, 'tar_files'):
@@ -365,7 +366,7 @@ def hubert_and_deberta_dataset_collate_fn(batch):
         text_feats,         # text feature
         text_mask,          # text feature mask
         gts,                # ground truth
-        hyps,               # hypothesis  
+        hyps,               # hypothesis
         slus,               # slu label
         gt_mask,            # ground truth mask
         hyp_mask,           # hypothesis mask
@@ -374,8 +375,8 @@ def hubert_and_deberta_dataset_collate_fn(batch):
         hyp_strs,           # hypothesis strings
         slu_strs,           # slu strings
     ) = zip(*batch)
-    
-    
+
+
     feats_padded = pad_sequence(feats, batch_first=True)  # (B, A, D)
     feat_mask_padded = pad_sequence(feat_mask, batch_first=True)  # (B, A)
     text_feats_padded = pad_sequence(text_feats, batch_first=True)  # (B, T, D)
@@ -402,7 +403,7 @@ def hubert_and_deberta_dataset_collate_fn(batch):
             "str_gt": gt_strs,
             "str_hyp": hyp_strs,
             "str_slu": slu_strs,
-    }   
+    }
 
     return batch_dict
 
@@ -410,7 +411,7 @@ def hubert_and_deberta_dataset_collate_fn(batch):
 if __name__ == "__main__":
     # Setup logging for testing
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    
+
     # tokenizer from HubertForCTC
     processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
 
@@ -420,14 +421,14 @@ if __name__ == "__main__":
     tokenizer = processor.tokenizer
 
     batch_size = 4
-    
+
     # 개별 파일 방식 테스트
     logger.info("\n=== Testing with individual files ===")
     mode = "tar" # or "file"
     if mode == "file":
         dataset = HuBERTandDeBERTaDataset(task="eval_0",
                                           feat_dir="./hubert_deberta_cache_retrial",
-                                          tokenizer=tokenizer,                                          
+                                          tokenizer=tokenizer,
                                           use_tar=False,
                                           debugging=True,
                                           debugging_num=16)
@@ -436,11 +437,11 @@ if __name__ == "__main__":
         logger.info("\n=== Testing with tar files ===")
         dataset = HuBERTandDeBERTaDataset(task="eval_0",
                                           feat_dir="../data/slu/hubert_deberta_cache_tar",
-                                          tokenizer=tokenizer,                                          
+                                          tokenizer=tokenizer,
                                           use_tar=True,
                                           debugging=False,
                                           debugging_num=16)
-    
+
     data_sampler = BatchSampler(dataset, batch_size=batch_size, shuffle=True)
 
     dataloader = DataLoader(

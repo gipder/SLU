@@ -164,7 +164,7 @@ def apply_condition_type(args, audio_feats, audio_mask, text_feats, text_mask):
 def update_best_model_link(metric_value, best_metric_value, metric_name, is_better_fn, save_dir, ckpt_path, args):
     """
     Best model symlink를 업데이트합니다.
-    
+
     Args:
         metric_value: 현재 metric 값
         best_metric_value: 지금까지의 최고 metric 값
@@ -173,7 +173,7 @@ def update_best_model_link(metric_value, best_metric_value, metric_name, is_bett
         save_dir: 저장 디렉토리
         ckpt_path: 체크포인트 경로
         args: 학습 인자
-    
+
     Returns:
         bool: best model이 업데이트되었는지 여부
     """
@@ -182,14 +182,14 @@ def update_best_model_link(metric_value, best_metric_value, metric_name, is_bett
             best_link = os.path.join(save_dir, "model", f"best_{metric_name}.pt")
         else:
             best_link = os.path.join(save_dir, f"best_{metric_name}.pt")
-        
+
         if os.path.islink(best_link) or os.path.exists(best_link):
             os.remove(best_link)
-        
+
         os.symlink(os.path.basename(ckpt_path), best_link)
         base_path_best_link = os.path.basename(best_link)
         base_path_ckpt_path = os.path.basename(ckpt_path)
-        
+
         logger.info(
             f"New best {metric_name}: {metric_value:.6f} "
             f"-> symlink: {base_path_best_link} "
@@ -456,7 +456,7 @@ def compute_valid_loss(
                 text_feats,
                 text_feat_mask,
             )
-            
+
             slus = slus.to(device)
             slu_mask = slu_mask.to(device)
 
@@ -715,7 +715,7 @@ def train_model(
                 valid_num_samples=args.valid_num_samples,
                 epoch=epoch,
             )
-            
+
             # Update best model based on EM (higher is better)
             if update_best_model_link(
                 metric_value=validate_result['em'],
@@ -727,7 +727,6 @@ def train_model(
                 args=args,
             ):
                 best_em = validate_result['em']
-            
 
     return
 

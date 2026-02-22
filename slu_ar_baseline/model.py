@@ -61,11 +61,11 @@ class ARModel(nn.Module):
             # Not implemented yet, but we can easily add DIT as an alternative to the basic transformer
             self.dit = DiscreteDualDiT(
                 vocab_size=cfg.vocab_size,
-            hidden_size=cfg.hidden_size,
-            depth=cfg.depth,
-            num_heads=cfg.num_heads,
-            audio_dim=cfg.audio_dim,
-            text_dim=cfg.text_dim,
+                hidden_size=cfg.hidden_size,
+                depth=cfg.depth,
+                num_heads=cfg.num_heads,
+                audio_dim=cfg.audio_dim,
+                text_dim=cfg.text_dim,
             )
             self.dfm_model = self.dit
         elif cfg.model_type == "transformer":
@@ -94,28 +94,40 @@ class ARModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        audio_feats: torch.Tensor,
-        audio_mask: torch.Tensor,
+        audio_feats: torch.Tensor = None,
+        audio_mask: torch.Tensor = None,
         text_feats: torch.Tensor = None,
         text_mask: torch.Tensor = None,
     ) -> torch.Tensor:
-                # x_t: B, T
+        # x_t: B, T
         B = input_ids.shape[0]
         T = input_ids.shape[1]
         K = self.cfg.vocab_size
-        
-        logits = self.slu_model(
-            input_ids,
-            audio_feats, text_feats,
-            ~(audio_mask.bool()), ~(text_mask.bool())
-        )
 
+        if audio_feats is None and audio_mask is None:
+            logits = self.slu_model(
+                input_ids,
+                None, text_feats,
+                None, ~(text_mask.bool())
+            )
+        elif text_feats is None and text_mask is None:
+            logits = self.slu_model(
+                input_ids,
+                audio_feats, None,
+                ~(audio_mask.bool()), None
+            )
+        else:
+            logits = self.slu_model(
+                input_ids,
+                audio_feats, text_feats,
+                ~(audio_mask.bool()), ~(text_mask.bool())
+            )
         return logits
 
     @torch.no_grad()
     def decode(
         self,
-        audio_feats: torch.Tensor,
+        audio_feats: torch.Tensor = None,
         text_feats: torch.Tensor = None,
         audio_mask: torch.Tensor = None,
         text_mask: torch.Tensor = None,
@@ -128,10 +140,22 @@ class ARModel(nn.Module):
         top_k: Optional[int] = None,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
+
+        if audio_feats is None and audio_mask is None:
+            return self.slu_model.decode(
+                None, text_feats, None, ~(text_mask.bool()),
+                max_output_length, sos_id, eos_id, use_cache=use_cache, device=device
+            )
+        elif text_feats is None and text_mask is None:
+            return self.slu_model.decode(
+                audio_feats, None, ~(audio_mask.bool()), None,
+                max_output_length, sos_id, eos_id, use_cache=use_cache, device=device
+            )
+
         return self.slu_model.decode(
             audio_feats, text_feats, ~(audio_mask.bool()), ~(text_mask.bool()),
             max_output_length, sos_id, eos_id, use_cache=use_cache, device=device
-        )               
+        )
 
 if __name__ == "__main__":
     B = 2
@@ -179,4 +203,3 @@ if __name__ == "__main__":
 
     print(f"decoded_ids: {decoded_ids.shape}")
     #print(f"length_logits: {length_logits.shape}")
-   
