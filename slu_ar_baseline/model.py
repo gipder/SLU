@@ -32,24 +32,6 @@ class ARModelConfig:
     norm_first: bool = True  # Whether to apply layer normalization before attention and FFN
 
 
-class DFMModelWrapper(ModelWrapper):
-    def __init__(self, model):
-        super().__init__(model)
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor, **extras) -> torch.Tensor:
-        audio_feats = extras["audio_feats"]
-        audio_mask = extras["audio_mask"]
-        text_feats = extras["text_feats"]
-        text_mask = extras["text_mask"]
-        logits = self.model(x, t, audio_feats, audio_mask, text_feats, text_mask) # B, T_out, K
-        prob = torch.nn.functional.softmax(logits.float(), dim=-1)
-        return prob
-
-    def predict_lengths(self, x: torch.Tensor, x_mask: torch.Tensor) -> torch.Tensor: # B
-        predict_lengths = self.model.predict_lengths(x, x_mask)
-        return predict_lengths
-
-
 class ARModel(nn.Module):
     def __init__(self, cfg: ARModelConfig):
         super().__init__()

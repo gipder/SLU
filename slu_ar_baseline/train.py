@@ -23,15 +23,6 @@ from torch.nn.utils.rnn import pad_sequence
 #from speech_featured_unet import DiscreteContextUnet
 from torch.amp import autocast, GradScaler
 
-# For DFML
-from flow_matching.path import MixtureDiscreteProbPath
-from flow_matching.path.path_sample import DiscretePathSample
-from flow_matching.path.scheduler import PolynomialConvexScheduler
-from flow_matching.utils import ModelWrapper
-from flow_matching.loss import MixturePathGeneralizedKL
-from flow_matching.solver import MixtureDiscreteEulerSolver
-
-#from model import DFMModel, DFMModelConfig, DFMModelWrapper
 from model import ARModel, ARModelConfig
 from hubert_deberta_dataset import HuBERTandDeBERTaDataset
 from hubert_deberta_dataset import hubert_and_deberta_dataset_collate_fn
