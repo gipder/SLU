@@ -34,7 +34,7 @@ def build_parser():
 
     # ---- evaluation ----
     p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--log_step", type=int, default=10, help="Logging step interval during training")
+    p.add_argument("--log_step", type=int, default=100, help="Logging step interval during training")
     p.add_argument("--num_workers", type=int, default=4)        
     p.add_argument("--seed", type=int, default=42)    
     p.add_argument("--gpu", type=str, default="0",
@@ -267,6 +267,19 @@ def main(args):
 
     assert os.path.exists(args.ckpt_path), f"Checkpoint path {args.ckpt_path} does not exist."    
     
+    # if args.ckpt_path is a link, resolve the link to get the actual checkpoint path
+    if os.path.islink(args.ckpt_path):
+        ckpt_dir = os.path.dirname(args.ckpt_path)
+        resolved_path = os.readlink(args.ckpt_path)
+        logger.info(f"Resolved checkpoint path: {resolved_path} "
+                    f"from symbolic link: {args.ckpt_path}")
+        args.ckpt_path = resolved_path
+        if not os.path.exists(args.ckpt_path):
+            basename = os.path.basename(args.ckpt_path)                
+            args.ckpt_path = os.path.join(ckpt_dir, basename)
+            logger.info(f"Resolved checkpoint path does not exist. "
+                        f"Converted to path: {args.ckpt_path}")
+
     checkpoint = torch.load(args.ckpt_path, map_location=device)
     model.load_state_dict(checkpoint["model"])
         
