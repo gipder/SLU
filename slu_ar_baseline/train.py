@@ -2,7 +2,7 @@ import os
 import sys
 import argparse
 from argparse import ArgumentParser
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,6 +25,7 @@ from torch.amp import autocast, GradScaler
 
 from model import ARModel, ARModelConfig
 from hubert_deberta_dataset import HuBERTandDeBERTaDataset
+from predict_model import SelfPromptARModel, SelfPromptARModelConfig
 from hubert_deberta_dataset import hubert_and_deberta_dataset_collate_fn
 from hubert_deberta_dataset import BatchSampler
 #from sampling import sampling_batch, sampling_debugging
@@ -136,6 +137,20 @@ def build_parser():
     p.add_argument("--augment_text_mask_span", type=int, default=3,
                    help="Text span length")
 
+    # ---- self prompt ----
+    p.add_argument("--use_self_prompt", type=str2bool, default=False,
+                   help="Use SelfPromptARModel with intent prediction auxiliary loss")
+    p.add_argument("--num_intent", type=int, default=80,
+                   help="Number of intent classes for prompt predictor")
+    p.add_argument("--intent_loss_weight", type=float, default=1.0,
+                   help="Weight for predict_intent_loss in total loss")
+    p.add_argument("--length_hidden_dim", type=int, default=128,
+                   help="Hidden dim for MaskedIntentPredictionModule")
+    p.add_argument("--length_dropout", type=float, default=0.1,
+                   help="Dropout for MaskedIntentPredictionModule")
+    p.add_argument("--prompt_tag_path", type=str, default="data/slu/INTENT",
+                   help="Path to INTENT/TAG label file used for prompt table")
+
     return p
 
 
@@ -147,6 +162,56 @@ def apply_condition_type(args, audio_feats, audio_mask, text_feats, text_mask):
     if args.condition_type == "text":
         return None, None, text_feats, text_mask
     raise ValueError(f"Invalid condition_type: {args.condition_type}")
+
+
+def _get_base_model(model):
+    m = model.module if isinstance(model, torch.nn.DataParallel) else model
+    return m
+
+
+def _build_tag_token_patterns(tokenizer, prompt_table: List[str]) -> List[Tuple[int, List[int]]]:
+    """TAG 문자열 테이블을 tokenizer id 시퀀스로 변환: [(tag_idx, [id...]), ...]"""
+    patterns = []
+    for tag_idx, tag in enumerate(prompt_table):
+        ids = tokenizer.encode(tag, add_special_tokens=False)
+        if len(ids) > 0:
+            patterns.append((tag_idx, ids))
+    return patterns
+
+
+def _find_first_matching_tag_id(token_ids: List[int], tag_patterns: List[Tuple[int, List[int]]]) -> int:
+    """토큰 시퀀스 내에서 가장 먼저 등장한 TAG 패턴의 tag_idx를 반환. 없으면 -1."""
+    best_tag_id = -1
+    best_pos = None
+    for tag_idx, pattern in tag_patterns:
+        n = len(pattern)
+        if n == 0 or n > len(token_ids):
+            continue
+        for i in range(len(token_ids) - n + 1):
+            if token_ids[i:i+n] == pattern:
+                if best_pos is None or i < best_pos:
+                    best_pos = i
+                    best_tag_id = tag_idx
+                break
+    return best_tag_id
+
+
+def _build_intent_gt_from_slu_ids(
+    slus: torch.Tensor,
+    slu_mask: Optional[torch.Tensor],
+    tag_patterns: List[Tuple[int, List[int]]],
+) -> torch.Tensor:
+    """SLU target token ids에서 TAG 매칭 기반 intent GT id (B,)를 생성. 매칭 실패는 -1."""
+    B, T = slus.shape
+    out = torch.full((B,), -1, dtype=torch.long, device=slus.device)
+    if not tag_patterns:
+        return out
+
+    for b in range(B):
+        valid_len = int(slu_mask[b].sum().item()) if slu_mask is not None else T
+        token_ids = slus[b, :valid_len].tolist()
+        out[b] = _find_first_matching_tag_id(token_ids, tag_patterns)
+    return out
 
 
 # -------------------------
@@ -256,11 +321,20 @@ def validate_model(
     )
     total_data_samples = len(val_dataset)
 
+    # intent 정확도 측정 준비 (use_self_prompt 활성 시)
+    tag_patterns = []
+    if getattr(args, 'use_self_prompt', False):
+        m = _get_base_model(model)
+        prompt_table = getattr(m, 'prompt_table', [])
+        tag_patterns = _build_tag_token_patterns(tokenizer, prompt_table)
+
     with torch.no_grad():
         hyp_ids = []
         target_ids = []
         str_asr_hyps = []
         str_slus = []
+        pred_intent_ids = []
+        gt_intent_ids = []
         step = 0
         count = 0
         for batch in val_loader:
@@ -277,6 +351,8 @@ def validate_model(
             audio_feat_mask = audio_feat_mask.to(device)
             text_feats = text_feats.to(device)
             text_feat_mask = text_feat_mask.to(device)
+            slus = slus.to(device)
+            slu_mask = slu_mask.to(device)
 
             audio_feats, audio_feat_mask, text_feats, text_feat_mask = apply_condition_type(
                 args,
@@ -289,22 +365,71 @@ def validate_model(
             slus = slus.to(device)
             slu_mask = slu_mask.to(device)
 
-            generated = model.decode(
-                audio_feats=audio_feats,
-                text_feats=text_feats,
-                audio_mask=audio_feat_mask,
-                text_mask=text_feat_mask,
-                max_output_length=args.max_output_length,
-                sos_id=sos_id,
-                eos_id=eos_id,
-                do_sample=False,
-                device=device,
-            )
+            batch_top_intent_ids = None
+            use_retrieval_decode = getattr(args, 'use_self_prompt', False)
+            m = _get_base_model(model)
+            # not working as I expected, so using decode_with_retrieval instead of separate retrieval + decode
+            if use_retrieval_decode and hasattr(m, 'decode_with_retrieval'):
+                generated = model.decode(
+                    audio_feats=audio_feats,
+                    text_feats=text_feats,
+                    audio_mask=audio_feat_mask,
+                    text_mask=text_feat_mask,
+                    max_output_length=args.max_output_length,
+                    sos_id=sos_id,
+                    eos_id=eos_id,
+                    do_sample=False,
+                    device=device,
+                )
+                """
+                decode_out = m.decode_with_retrieval(
+                    audio_feats=audio_feats,
+                    text_feats=text_feats,
+                    audio_mask=audio_feat_mask,
+                    text_mask=text_feat_mask,
+                    tokenizer=tokenizer,
+                    top_k_retrieval=1,
+                    max_output_length=args.max_output_length,
+                    sos_id=sos_id,
+                    eos_id=eos_id,
+                    device=device,
+                )
+                generated = decode_out["generated"]
+                batch_top_intent_ids = decode_out.get("top_intent_ids", None)
+                """
+            else:
+                generated = model.decode(
+                    audio_feats=audio_feats,
+                    text_feats=text_feats,
+                    audio_mask=audio_feat_mask,
+                    text_mask=text_feat_mask,
+                    max_output_length=args.max_output_length,
+                    sos_id=sos_id,
+                    eos_id=eos_id,
+                    do_sample=False,
+                    device=device,
+                )
 
             hyp_ids.extend(generated.cpu().tolist())
             target_ids.extend(slus.cpu().tolist())
             str_asr_hyps.extend(str_asr_hypothesis)
             str_slus.extend(str_slu_targets)
+
+            if getattr(args, 'use_self_prompt', False) and tag_patterns:
+                if batch_top_intent_ids is None:
+                    m = _get_base_model(model)
+                    retrieval = m.retrieve_prompts(
+                        audio_feats=audio_feats,
+                        text_feats=text_feats,
+                        audio_mask=audio_feat_mask,
+                        text_mask=text_feat_mask,
+                        top_k=1,
+                    )
+                    batch_top_intent_ids = retrieval['top_intent_ids']
+
+                pred_intent_ids.extend(batch_top_intent_ids[:, 0].detach().cpu().tolist())
+                intent_gt_batch = _build_intent_gt_from_slu_ids(slus, slu_mask, tag_patterns)
+                gt_intent_ids.extend(intent_gt_batch.cpu().tolist())
 
             step += 1
             count += slus.size(0)
@@ -355,6 +480,13 @@ def validate_model(
     logger.info(f"Ground Truth WER{epoch_info}: {gt_wer * 100:.4f}%")
     logger.info(f"Exact Matching{epoch_info}: {accuracy * 100:.4f}% ({correct_predictions}/{valid_num_samples_to_use})")
 
+    intent_acc = None
+    if getattr(args, 'use_self_prompt', False) and gt_intent_ids:
+        valid_gt = sum(1 for g in gt_intent_ids if g >= 0)
+        correct_intent = sum(1 for p, g in zip(pred_intent_ids, gt_intent_ids) if g >= 0 and p == g)
+        intent_acc = correct_intent / max(1, valid_gt)
+        logger.info(f"Intent Accuracy{epoch_info}: {intent_acc * 100:.4f}% ({correct_intent}/{valid_gt})")
+
     return {
         'slu_wer': slu_wer,
         #'asr_wer': asr_wer,
@@ -363,6 +495,7 @@ def validate_model(
         'em': accuracy,
         'total_samples': valid_num_samples_to_use,
         'correct_predictions': correct_predictions,
+        'intent_acc': intent_acc,
     }
 
 
@@ -423,10 +556,19 @@ def compute_valid_loss(
 
     every_n = max(1, len(val_loader) // 4)
 
+    tag_patterns = []
+    if getattr(args, 'use_self_prompt', False):
+        m = _get_base_model(model)
+        prompt_table = getattr(m, 'prompt_table', [])
+        tag_patterns = _build_tag_token_patterns(tokenizer, prompt_table)
+
     with torch.no_grad():
         step = 0
         count = 0
-        loss_sum = 0.0  # per-token 평균 loss의 배치 합산
+        loss_sum = 0.0
+        ar_loss_sum = 0.0
+        intent_loss_sum = 0.0
+        intent_loss_count = 0
         for batch in val_loader:
             audio_feats = batch["feat"]
             audio_feat_mask = batch["feat_mask"]
@@ -452,7 +594,7 @@ def compute_valid_loss(
             slu_mask = slu_mask.to(device)
 
             B = slus.size(0)
-            lengths = slu_mask.sum(dim=1).to(device)  # B,
+            lengths = slu_mask.sum(dim=1)  # B,
             T = lengths.max().item()  # max target length in the batch
             input_ids = torch.zeros((B, T+1), device=device, dtype=torch.long)
             input_ids[:, 1:] = slus
@@ -464,22 +606,48 @@ def compute_valid_loss(
 
             input_mask = input_ids != 0  # B, T_o+1
 
+            intent_gt = None
+            if getattr(args, 'use_self_prompt', False) and tag_patterns:
+                intent_gt = _build_intent_gt_from_slu_ids(slus, slu_mask, tag_patterns)
+
             with torch.amp.autocast('cuda', enabled=use_cuda):
                 # logits B, T, K
-                logits = model(input_ids=input_ids,
+                out = model(input_ids=input_ids,
                             audio_feats=audio_feats,
                             audio_mask=audio_feat_mask,
                             text_feats=text_feats,
                             text_mask=text_feat_mask)
+                if isinstance(out, tuple):
+                    logits, prompt_logits = out
+                else:
+                    logits = out
+                    prompt_logits = None
 
                 logits_perm = logits.permute(0, -1, 1)
                 ar_loss = criterion(logits_perm, target_ids)
                 mask = input_mask.float()
                 denom = mask.sum().clamp_min(1.0)
-                # ar_loss: per-token 평균 (단위 일관성 유지)
                 ar_loss = (ar_loss * mask).sum() / denom
 
-            loss_sum += ar_loss.item()
+                predict_intent_loss = None
+                if prompt_logits is not None and intent_gt is not None:
+                    intent_gt = intent_gt.to(prompt_logits.device, dtype=torch.long)
+                    valid = intent_gt >= 0
+                    if valid.any():
+                        predict_intent_loss = F.cross_entropy(
+                            prompt_logits[valid], intent_gt[valid]
+                        )
+
+                if predict_intent_loss is not None:
+                    loss = ar_loss + args.intent_loss_weight * predict_intent_loss
+                else:
+                    loss = ar_loss
+
+            loss_sum += loss.item()
+            ar_loss_sum += ar_loss.item()
+            if predict_intent_loss is not None:
+                intent_loss_sum += predict_intent_loss.item()
+                intent_loss_count += 1
 
             step += 1
             count += slus.size(0)
@@ -488,16 +656,26 @@ def compute_valid_loss(
                 logger.info(f"Evaluation step {step:,}/{len(val_loader):,} completed.")
                 logger.info(f"  Processed {count:,}/{total_samples:,} samples.")
             """
-    # 배치 수로 나눠서 per-token 평균의 배치 평균 → ar_loss와 동일한 단위
     valid_loss = loss_sum / max(1, step)
+    valid_ar_loss = ar_loss_sum / max(1, step)
+    valid_intent_loss = None
+    if intent_loss_count > 0:
+        valid_intent_loss = intent_loss_sum / intent_loss_count
 
     if epoch is None:
         epoch_info = ""
     else:
         epoch_info = f" at epoch {epoch}"
-    #logger.info(f"Valid loss{epoch_info}: {valid_loss:.4f}")
+    log_msg = f"Valid loss{epoch_info}: total={valid_loss:.4f}, ar={valid_ar_loss:.4f}"
+    if valid_intent_loss is not None:
+        log_msg += f", predict_intent={valid_intent_loss:.4f}"
+    logger.info(log_msg)
 
-    return {'valid_loss': valid_loss}
+    return {
+        'valid_loss': valid_loss,
+        'valid_ar_loss': valid_ar_loss,
+        'valid_intent_loss': valid_intent_loss,
+    }
 
 
 # -------------------------
@@ -545,6 +723,15 @@ def train_model(
 
     best_valid_loss = float("inf")
     best_em = 0.0  # EM (exact matching) is higher is better
+
+    # TAG token patterns: use_self_prompt 활성 시 predict_intent_loss 계산에 사용
+    tag_patterns = []
+    if getattr(args, 'use_self_prompt', False):
+        m = _get_base_model(model)
+        prompt_table = getattr(m, 'prompt_table', [])
+        tag_patterns = _build_tag_token_patterns(tokenizer, prompt_table)
+        logger.info(f"* tag_patterns built: {len(tag_patterns)} labels")
+
     for epoch in range(init_epoch, args.final_epoch + 1):
         logger.info(f"===== Starting epoch {epoch} =====")
 
@@ -565,6 +752,8 @@ def train_model(
             audio_feat_mask = audio_feat_mask.to(device)
             text_feats = text_feats.to(device)
             text_feat_mask = text_feat_mask.to(device)
+            slus = slus.to(device)
+            slu_mask = slu_mask.to(device)
 
             if augmentor is not None:
                 audio_feats, text_feats, audio_feat_mask, text_feat_mask = augmentor.apply(
@@ -584,7 +773,7 @@ def train_model(
             )
 
             B = slus.size(0)
-            lengths = slu_mask.sum(dim=1).to(device)  # B,
+            lengths = slu_mask.sum(dim=1)  # B,
             T = lengths.max().item()  # max target length in the batch
             input_ids = torch.zeros((B, T+1), device=device, dtype=torch.long)
             input_ids[:, 1:] = slus
@@ -596,13 +785,24 @@ def train_model(
 
             input_mask = input_ids != 0  # B, T_o+1
 
+            # intent GT: SLU target token ids에서 TAG 패턴 매칭으로 추출
+            intent_gt = None
+            if getattr(args, 'use_self_prompt', False) and tag_patterns:
+                intent_gt = _build_intent_gt_from_slu_ids(slus, slu_mask, tag_patterns)
+
             with torch.amp.autocast('cuda', enabled=use_cuda):
-                # logits B, T, K
-                logits = model(input_ids=input_ids,
-                               audio_feats=audio_feats,
-                               audio_mask=audio_feat_mask,
-                               text_feats=text_feats,
-                               text_mask=text_feat_mask)
+                # logits B, T, K  (SelfPromptARModel은 (logits, prompt_logits) tuple 반환)
+                out = model(input_ids=input_ids,
+                            audio_feats=audio_feats,
+                            audio_mask=audio_feat_mask,
+                            text_feats=text_feats,
+                            text_mask=text_feat_mask)
+                
+                if isinstance(out, tuple):                    
+                    logits, prompt_logits = out
+                else:
+                    logits = out
+                    prompt_logits = None
 
                 logits_perm = logits.permute(0, -1, 1)
                 ar_loss = criterion(logits_perm, target_ids)
@@ -610,8 +810,21 @@ def train_model(
                 denom = mask.sum().clamp_min(1.0)
                 ar_loss = (ar_loss * mask).sum() / denom
 
+                # predict_intent_loss: prompt_logits와 intent GT가 모두 있을 때만 CE loss
+                predict_intent_loss = None
+                if prompt_logits is not None and intent_gt is not None:
+                    intent_gt = intent_gt.to(prompt_logits.device, dtype=torch.long)
+                    valid = intent_gt >= 0
+                    if valid.any():
+                        predict_intent_loss = F.cross_entropy(
+                            prompt_logits[valid], intent_gt[valid]
+                        )
+
             # Final loss combination
-            loss = ( ar_loss )
+            if predict_intent_loss is not None:
+                loss = ar_loss + args.intent_loss_weight * predict_intent_loss
+            else:
+                loss = ar_loss
 
             optim.zero_grad(set_to_none=True)
             prev_scale = scaler.get_scale()
@@ -638,15 +851,22 @@ def train_model(
 
             if step % args.log_step == 0:
                 grad_norm_val = float(grad_norm) if grad_norm is not None else 0.0
-                logger.info(f"[Epoch {epoch}] "
-                            f"[step {step:,}] "
-                            f"lr={optim_scheduler.get_last_lr()[0]:.6f}, "
-                            f"loss={loss_val:.6f}, "
-                            f"loss_ema={loss_ema:.6f}, "
-                            f"ar_loss={ar_loss.item():.6f}, "
-                            f"grad_norm={grad_norm_val:.4f}, "
-                            f"scale={scaler.get_scale():.1f}"
-                            )
+                intent_loss_val = predict_intent_loss.item() if predict_intent_loss is not None else 0.0
+                log_msg = (
+                    f"[Epoch {epoch}] "
+                    f"[step {step:,}] "
+                    f"lr={optim_scheduler.get_last_lr()[0]:.6f}, "
+                    f"loss={loss_val:.6f}, "
+                    f"loss_ema={loss_ema:.6f}, "
+                    f"ar_loss={ar_loss.item():.6f}, "
+                )
+                if getattr(args, 'use_self_prompt', False):
+                    log_msg += f"predict_intent_loss={intent_loss_val:.6f}, "
+                log_msg += (
+                    f"grad_norm={grad_norm_val:.4f}, "
+                    f"scale={scaler.get_scale():.1f}"
+                )
+                logger.info(log_msg)
             # Increment step counter
             step += 1
 
@@ -788,23 +1008,49 @@ if __name__ == "__main__":
               f"Using actual vocab size.")
         args.vocab_size = actual_vocab_size
 
-    cfg = ARModelConfig(
-        vocab_size=args.vocab_size,
-        hidden_size=args.hidden_size,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        audio_dim=args.audio_dim,
-        text_dim=args.text_dim,
-        max_output_length=args.max_output_length,
-        model_type=args.model_type,
-        norm_first=args.norm_first,
-    )
-
-    logger.info(f"* ARModelConfig: ")
-    logger.info(json.dumps(asdict(cfg), indent=2))
-
-    #dfm_model = DFMModel(cfg, device=device)
-    model = ARModel(cfg)
+    if args.use_self_prompt:
+        cfg = SelfPromptARModelConfig(
+            vocab_size=args.vocab_size,
+            hidden_size=args.hidden_size,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            audio_dim=args.audio_dim,
+            text_dim=args.text_dim,
+            max_output_length=args.max_output_length,
+            model_type=args.model_type,
+            norm_first=args.norm_first,
+            num_intent=args.num_intent,
+            length_hidden_dim=args.length_hidden_dim,
+            length_dropout=args.length_dropout,
+            prompt_tag_path=args.prompt_tag_path,
+        )
+        logger.info(f"* SelfPromptARModelConfig: ")
+        logger.info(json.dumps(asdict(cfg), indent=2))
+        model = SelfPromptARModel(cfg)
+        loaded_from_file = getattr(model, "prompt_table_loaded_from_file", False)
+        loaded_path = getattr(model, "prompt_table_path", args.prompt_tag_path)
+        if loaded_from_file:
+            logger.info(f"* Loaded intent prompt table from: {loaded_path}")
+        else:
+            logger.warning(
+                f"* Intent prompt file not found at resolved path: {loaded_path}. "
+                "Using synthetic fallback labels (INTENT_0..)."
+            )
+    else:
+        cfg = ARModelConfig(
+            vocab_size=args.vocab_size,
+            hidden_size=args.hidden_size,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            audio_dim=args.audio_dim,
+            text_dim=args.text_dim,
+            max_output_length=args.max_output_length,
+            model_type=args.model_type,
+            norm_first=args.norm_first,
+        )
+        logger.info(f"* ARModelConfig: ")
+        logger.info(json.dumps(asdict(cfg), indent=2))
+        model = ARModel(cfg)
 
     if args.ckpt_path is not None:
         checkpoint = torch.load(args.ckpt_path, map_location=device)
@@ -814,7 +1060,10 @@ if __name__ == "__main__":
 
     #logger.info(f"{dfm_model.device=}")
     trainable_params = 0
-    for model_part in [model.slu_model]:
+    model_parts = [model.slu_model]
+    if args.use_self_prompt:
+        model_parts.append(model.prompt_predictor)
+    for model_part in model_parts:
         tmp_trainable_params = sum(p.numel() for p in model_part.parameters() if p.requires_grad)
         trainable_params += tmp_trainable_params
         logger.info(f"{class_name(model_part)} Trainable Parameters: {tmp_trainable_params:,}")
