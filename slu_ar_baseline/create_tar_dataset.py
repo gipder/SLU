@@ -159,31 +159,28 @@ if __name__ == "__main__":
                         help="Task name (e.g., train, eval_0, eval_1, test_0, test_1)")
     parser.add_argument("--num_shards", type=int, default=4,
                         help="Number of tar files to create (default: 4)")
-    parser.add_argument("--tokenizer_model_name", type=str, default=None,
-                        help="Tokenizer model name to extract metadata (e.g., facebook/hubert-large-ls960-ft)")
+    parser.add_argument("--tokenizer_model_name", type=str, default="facebook/hubert-large-ls960-ft",
+                        help="Tokenizer model name or fine-tuned checkpoint path (default: facebook/hubert-large-ls960-ft). "
+                             "If a checkpoint path is given (e.g., ../finetune_asr/outputs/.../epoch_010), "
+                             "the saved tokenizer from that checkpoint will be used.")
     parser.add_argument("--list_contents", action="store_true",
                         help="List contents of first tar file after creation")
     
     args = parser.parse_args()
     
     # 토크나이저 로드 (메타데이터 추출용)
-    tokenizer = None
-    if args.tokenizer_model_name:
-        try:
-            from transformers import AutoProcessor
-            processor = AutoProcessor.from_pretrained(args.tokenizer_model_name)
-            tokenizer = processor.tokenizer
-            logger.info(f"Loaded tokenizer from {args.tokenizer_model_name}")
-            
-            # 숫자 토큰 추가
-            new_tokens = [str(i) for i in range(10)]
-            num_added = tokenizer.add_tokens(new_tokens)
-            logger.info(f"Added {num_added} number tokens to tokenizer")
-        except Exception as e:
-            logger.warning(f"Failed to load tokenizer: {e}, cache will not be created")
-            tokenizer = None
-    else:
-        logger.info("Tokenizer not specified, cache file will not be created. Use --tokenizer_model_name to create cache.")
+    from transformers import Wav2Vec2Processor
+    EXTRA_TOKENS = [str(d) for d in range(10)]
+    processor = Wav2Vec2Processor.from_pretrained(args.tokenizer_model_name)
+    tokenizer = processor.tokenizer
+    logger.info(f"Loaded tokenizer from {args.tokenizer_model_name}")
+
+    # 숫자 토큰 추가 (이미 있는 토큰은 제외, 체크포인트에서 로드 시 이미 포함되어 있을 수 있음)
+    to_add = [t for t in EXTRA_TOKENS if t not in tokenizer.get_vocab()]
+    num_added = 0
+    if to_add:
+        num_added = tokenizer.add_tokens(to_add)
+    logger.info(f"Added {num_added} number tokens to tokenizer: {to_add}")
     
     create_tar_archives(
         source_dir=args.source_dir,

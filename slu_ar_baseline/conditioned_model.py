@@ -3,51 +3,65 @@ import torch.nn as nn
 from dataclasses import dataclass
 from typing import Optional
 
+from dit import DiscreteDualDiT
 from basic_transformer import BasicTransformer
-from encoder_decoder_transformer import EncoderDecoderTransformer
-from fused_transformer import FusedTransformer
+from length_predictor import MaskedLengthPredictionModule
+from flow_matching.utils import ModelWrapper
+
+# for DFM testing
+from flow_matching.path import MixtureDiscreteProbPath
+from flow_matching.path.path_sample import DiscretePathSample
+from flow_matching.path.scheduler import PolynomialConvexScheduler
+from flow_matching.utils import ModelWrapper
+from flow_matching.loss import MixturePathGeneralizedKL
+from flow_matching.solver import MixtureDiscreteEulerSolver
 
 @dataclass
-class ARModelConfig:
+class IntentConditionARModelConfig:
+    # DIT 설정
     vocab_size: int = 42
     hidden_size: int = 512
     depth: int = 6
     num_heads: int = 8
     audio_dim: int = 1024
     text_dim: int = 1024
-    max_output_length: int = 256
+    max_output_length: int = 256    
     sos_token_id: int = 1
     eos_token_id: int = 2
-    model_type: str = "transformer"  # "transformer", "encoder_decoder_transformer", or "fused_transformer"
-    norm_first: bool = True
+    model_type: str = "transformer"  # "dit" or "transformer"
+    norm_first: bool = True  # Whether to apply layer normalization before attention and FFN
+    num_intent: int = 128
 
 
-class ARModel(nn.Module):
-    def __init__(self, cfg: ARModelConfig):
+class IntentConditionARModel(nn.Module):
+    def __init__(self, cfg: IntentConditionARModelConfig):
         super().__init__()
         self.cfg = cfg
+        self.dit = None
         self.basic_transformer = None
-        self.encoder_decoder_transformer = None
-
-        _common = dict(
-            vocab_size=cfg.vocab_size,
-            hidden_size=cfg.hidden_size,
-            depth=cfg.depth,
-            num_heads=cfg.num_heads,
-            audio_dim=cfg.audio_dim,
-            text_dim=cfg.text_dim,
-            max_output_length=cfg.max_output_length,
-        )
-
-        if cfg.model_type == "transformer":
-            self.basic_transformer = BasicTransformer(**_common)
+        self.dfm_model = None
+        if cfg.model_type == "dit":
+            # Not implemented yet, but we can easily add DIT as an alternative to the basic transformer
+            self.dit = DiscreteDualDiT(
+                vocab_size=cfg.vocab_size,
+                hidden_size=cfg.hidden_size,
+                depth=cfg.depth,
+                num_heads=cfg.num_heads,
+                audio_dim=cfg.audio_dim,
+                text_dim=cfg.text_dim,
+            )
+            self.dfm_model = self.dit
+        elif cfg.model_type == "transformer":
+            self.basic_transformer = BasicTransformer(
+                vocab_size=cfg.vocab_size,
+                hidden_size=cfg.hidden_size,
+                depth=cfg.depth,
+                num_heads=cfg.num_heads,
+                audio_dim=cfg.audio_dim,
+                text_dim=cfg.text_dim,
+                max_output_length=cfg.max_output_length
+            )
             self.slu_model = self.basic_transformer
-        elif cfg.model_type == "encoder_decoder_transformer":
-            self.encoder_decoder_transformer = EncoderDecoderTransformer(**_common)
-            self.slu_model = self.encoder_decoder_transformer
-        elif cfg.model_type == "fused_transformer":
-            self.fused_transformer = FusedTransformer(**_common)
-            self.slu_model = self.fused_transformer
         else:
             raise ValueError(f"Unknown model_type: {cfg.model_type}")
 

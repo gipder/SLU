@@ -3,9 +3,10 @@
 
 set -e
 
-EXTRACT_FEAT_DIR="../data/slu/hubert_deberta_cache"
-TAR_OUTPUT_DIR="../data/slu/hubert_deberta_cache_tar"
+EXTRACT_FEAT_DIR="../data/slu/hubert_deberta_cache_wt_asr_wer20"
+TAR_OUTPUT_DIR="../data/slu/hubert_deberta_cache_wt_asr_wer20_tar"
 TOKENIZER="facebook/hubert-large-ls960-ft"
+#TOKENIZER="../finetune_asr/outputs/test_hubert_stop_lora_lr3e-4/epoch_030"
 
 echo "🚀 TAR 생성 시작 (메타데이터 캐시 자동 생성)"
 echo "==========================================="

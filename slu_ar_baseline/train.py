@@ -3,6 +3,7 @@ import sys
 import argparse
 from argparse import ArgumentParser
 from typing import Optional, Dict, List, Tuple
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -80,7 +81,7 @@ def build_parser():
     p.add_argument("--max_output_length", type=int, default=512, help="Maximum output length during inference")
     #p.add_argument("--noise_ratio", type=float, default=0.5, help="Noise ratio for UniformDiscreteProbPath")
     #p.add_argument("--n_step", type=int, default=5, help="Number of sampling steps during inference")
-    p.add_argument("--model_type", type=str, choices=["dit", "transformer"], default="transformer")
+    p.add_argument("--model_type", type=str, choices=["transformer", "encoder_decoder_transformer", "fused_transformer"], default="transformer")
     p.add_argument("--norm_first", type=str2bool, default=True, help="Whether to apply layer normalization before attention and FFN")
     p.add_argument("--condition_type", type=str, choices=["both", "audio", "text"], default="both", help="Type of conditioning for the model")
     ## for length predictor
@@ -99,6 +100,8 @@ def build_parser():
     p.add_argument("--test_task", type=str, default="test")
     p.add_argument("--tokenizer_model_name", type=str, default="facebook/hubert-large-ls960-ft")
     p.add_argument("--mask_token", type=str, default="[MASK]")
+    p.add_argument("--use_intent_token", type=str2bool, default=False,
+                   help="Whether to add INTENT-derived tokens (and sentencepiece variants) to tokenizer")
     p.add_argument("--valid_num_samples", type=int, default=2048, help="Number of samples to use for validation")
     #p.add_argument("--shuffle_train", type=bool, default=True)
 
@@ -214,6 +217,64 @@ def _build_intent_gt_from_slu_ids(
     return out
 
 
+def _build_prompt_prefix_lengths(
+    intent_gt: Optional[torch.Tensor],
+    prompt_table: List[str],
+    tokenizer,
+) -> Optional[torch.Tensor]:
+    """intent GT 기준 정답 prompt prefix 길이(B,)를 생성. invalid GT는 0."""
+    if intent_gt is None:
+        return None
+
+    lengths = torch.zeros_like(intent_gt, dtype=torch.long)
+    for b in range(intent_gt.size(0)):
+        idx = int(intent_gt[b].item())
+        if 0 <= idx < len(prompt_table):
+            lengths[b] = len(tokenizer.encode(prompt_table[idx], add_special_tokens=False))
+    return lengths
+
+
+def _resolve_label_path(label_path: str) -> Path:
+    path = Path(label_path)
+    if path.is_absolute():
+        return path
+
+    module_dir = Path(__file__).resolve().parent
+    workspace_root = module_dir.parent
+    candidates = [
+        Path.cwd() / path,
+        module_dir / path,
+        workspace_root / path,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return (Path.cwd() / path).resolve()
+
+
+def _load_intent_labels(label_path: str) -> List[str]:
+    path = _resolve_label_path(label_path)
+    if not path.exists():
+        logger.warning(f"Intent label file not found: {path}")
+        return []
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    logger.info(f"* Loaded {len(lines)} intent labels from: {path}")
+    return lines
+
+
+def _build_intent_token_candidates(intent_labels: List[str]) -> List[str]:
+    """Build tokenizer tokens from full INTENT labels only."""
+    spm_prefix = "▁"
+    candidates = []
+
+    for label in intent_labels:
+        # INTENT appears at the beginning, so keep only sentencepiece-style boundary form.
+        candidates.append(spm_prefix + label)
+
+    # Stable deduplication while preserving insertion order.
+    return list(dict.fromkeys(candidates))
+
+
 # -------------------------
 # Best Model Link Update
 # -------------------------
@@ -323,6 +384,7 @@ def validate_model(
 
     # intent 정확도 측정 준비 (use_self_prompt 활성 시)
     tag_patterns = []
+    prompt_table = []
     if getattr(args, 'use_self_prompt', False):
         m = _get_base_model(model)
         prompt_table = getattr(m, 'prompt_table', [])
@@ -368,35 +430,40 @@ def validate_model(
             batch_top_intent_ids = None
             use_retrieval_decode = getattr(args, 'use_self_prompt', False)
             m = _get_base_model(model)
-            # not working as I expected, so using decode_with_retrieval instead of separate retrieval + decode
-            if use_retrieval_decode and hasattr(m, 'decode_with_retrieval'):
-                generated = model.decode(
+
+            if use_retrieval_decode and hasattr(m, 'retrieve_prompts') and hasattr(m, 'decode_with_prompt'):
+                # 1. 한 번만 retrieve
+                retrieval = m.retrieve_prompts(
                     audio_feats=audio_feats,
                     text_feats=text_feats,
                     audio_mask=audio_feat_mask,
                     text_mask=text_feat_mask,
-                    max_output_length=args.max_output_length,
-                    sos_id=sos_id,
-                    eos_id=eos_id,
-                    do_sample=False,
-                    device=device,
+                    top_k=1,
                 )
-                """
-                decode_out = m.decode_with_retrieval(
+                batch_top_intent_ids = retrieval['top_intent_ids']
+                #print(f"{retrieval['retrieved_prompts']=}")
+                # 2. top-1 intent prefix tokenize
+                prefix_id_list = []
+                for row_labels in retrieval["retrieved_prompts"]:
+                    ids = tokenizer.encode(row_labels[0])
+                    prefix_id_list.append(ids)
+                max_p = max(len(ids) for ids in prefix_id_list)
+                pad_id = getattr(tokenizer, "pad_token_id", 0)
+                padded = [ids + [pad_id] * (max_p - len(ids)) for ids in prefix_id_list]
+                prompt_prefix_ids = torch.tensor(padded, dtype=torch.long)
+
+                # 3. prompt-conditioned decode (retrieve는 위에서 완료)
+                generated = m.decode_with_prompt(
                     audio_feats=audio_feats,
                     text_feats=text_feats,
                     audio_mask=audio_feat_mask,
                     text_mask=text_feat_mask,
-                    tokenizer=tokenizer,
-                    top_k_retrieval=1,
+                    prompt_prefix_ids=prompt_prefix_ids,
                     max_output_length=args.max_output_length,
                     sos_id=sos_id,
                     eos_id=eos_id,
                     device=device,
                 )
-                generated = decode_out["generated"]
-                batch_top_intent_ids = decode_out.get("top_intent_ids", None)
-                """
             else:
                 generated = model.decode(
                     audio_feats=audio_feats,
@@ -415,18 +482,7 @@ def validate_model(
             str_asr_hyps.extend(str_asr_hypothesis)
             str_slus.extend(str_slu_targets)
 
-            if getattr(args, 'use_self_prompt', False) and tag_patterns:
-                if batch_top_intent_ids is None:
-                    m = _get_base_model(model)
-                    retrieval = m.retrieve_prompts(
-                        audio_feats=audio_feats,
-                        text_feats=text_feats,
-                        audio_mask=audio_feat_mask,
-                        text_mask=text_feat_mask,
-                        top_k=1,
-                    )
-                    batch_top_intent_ids = retrieval['top_intent_ids']
-
+            if use_retrieval_decode and tag_patterns and batch_top_intent_ids is not None:
                 pred_intent_ids.extend(batch_top_intent_ids[:, 0].detach().cpu().tolist())
                 intent_gt_batch = _build_intent_gt_from_slu_ids(slus, slu_mask, tag_patterns)
                 gt_intent_ids.extend(intent_gt_batch.cpu().tolist())
@@ -607,8 +663,10 @@ def compute_valid_loss(
             input_mask = input_ids != 0  # B, T_o+1
 
             intent_gt = None
+            prompt_prefix_lengths = None
             if getattr(args, 'use_self_prompt', False) and tag_patterns:
                 intent_gt = _build_intent_gt_from_slu_ids(slus, slu_mask, tag_patterns)
+                prompt_prefix_lengths = _build_prompt_prefix_lengths(intent_gt, prompt_table, tokenizer)
 
             with torch.amp.autocast('cuda', enabled=use_cuda):
                 # logits B, T, K
@@ -626,6 +684,11 @@ def compute_valid_loss(
                 logits_perm = logits.permute(0, -1, 1)
                 ar_loss = criterion(logits_perm, target_ids)
                 mask = input_mask.float()
+                if getattr(args, 'use_self_prompt', False) and prompt_prefix_lengths is not None:
+                    for b in range(B):
+                        prefix_len = int(prompt_prefix_lengths[b].item())
+                        if prefix_len > 0:
+                            mask[b, :min(prefix_len, mask.size(1))] = 0.0
                 denom = mask.sum().clamp_min(1.0)
                 ar_loss = (ar_loss * mask).sum() / denom
 
@@ -726,6 +789,7 @@ def train_model(
 
     # TAG token patterns: use_self_prompt 활성 시 predict_intent_loss 계산에 사용
     tag_patterns = []
+    prompt_table = []
     if getattr(args, 'use_self_prompt', False):
         m = _get_base_model(model)
         prompt_table = getattr(m, 'prompt_table', [])
@@ -787,8 +851,10 @@ def train_model(
 
             # intent GT: SLU target token ids에서 TAG 패턴 매칭으로 추출
             intent_gt = None
+            prompt_prefix_lengths = None
             if getattr(args, 'use_self_prompt', False) and tag_patterns:
                 intent_gt = _build_intent_gt_from_slu_ids(slus, slu_mask, tag_patterns)
+                prompt_prefix_lengths = _build_prompt_prefix_lengths(intent_gt, prompt_table, tokenizer)
 
             with torch.amp.autocast('cuda', enabled=use_cuda):
                 # logits B, T, K  (SelfPromptARModel은 (logits, prompt_logits) tuple 반환)
@@ -807,6 +873,11 @@ def train_model(
                 logits_perm = logits.permute(0, -1, 1)
                 ar_loss = criterion(logits_perm, target_ids)
                 mask = input_mask.float()
+                if getattr(args, 'use_self_prompt', False) and prompt_prefix_lengths is not None:
+                    for b in range(B):
+                        prefix_len = int(prompt_prefix_lengths[b].item())
+                        if prefix_len > 0:
+                            mask[b, :min(prefix_len, mask.size(1))] = 0.0
                 denom = mask.sum().clamp_min(1.0)
                 ar_loss = (ar_loss * mask).sum() / denom
 
@@ -819,6 +890,13 @@ def train_model(
                         predict_intent_loss = F.cross_entropy(
                             prompt_logits[valid], intent_gt[valid]
                         )
+                    #print(f"{intent_gt[valid]=}")
+                    #print(f"{prompt_logits[valid]=}")
+                    #print(f"{intent_gt[valid].shape=}")
+                    #print(f"{prompt_logits[valid].shape=}")
+                    #print(f"{torch.argmax(prompt_logits[valid], dim=1)=}")
+                    #import sys
+                    #sys.exit(0)
 
             # Final loss combination
             if predict_intent_loss is not None:
@@ -887,32 +965,34 @@ def train_model(
         )
         logger.info(f"Saved: {ckpt_path}")
 
-        logger.info(f"===== Valid Loss Calculation at epoch {epoch} =====")
-        valid_loss = compute_valid_loss(
-            model=model,
-            eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
-            args=args,
-            sos_id=sos_id,
-            eos_id=eos_id,
-            device=device,
-            epoch=epoch,
-            criterion=criterion,
-        )
+        # check validation (validation loss only)
+        if epoch % args.eval_epoch == 0:
+            logger.info(f"===== Valid Loss Calculation at epoch {epoch} =====")
+            valid_loss = compute_valid_loss(
+                model=model,
+                eval_dataset=eval_dataset,
+                tokenizer=tokenizer,
+                args=args,
+                sos_id=sos_id,
+                eos_id=eos_id,
+                device=device,
+                epoch=epoch,
+                criterion=criterion,
+            )
 
-        # Update best model based on valid loss (lower is better)
-        if update_best_model_link(
-            metric_value=valid_loss['valid_loss'],
-            best_metric_value=best_valid_loss,
-            metric_name="valid_loss",
-            is_better_fn=lambda x, y: x < y,  # lower loss is better
-            save_dir=save_dir,
-            ckpt_path=ckpt_path,
-            args=args,
-        ):
-            best_valid_loss = valid_loss['valid_loss']
+            # Update best model based on valid loss (lower is better)
+            if update_best_model_link(
+                metric_value=valid_loss['valid_loss'],
+                best_metric_value=best_valid_loss,
+                metric_name="valid_loss",
+                is_better_fn=lambda x, y: x < y,  # lower loss is better
+                save_dir=save_dir,
+                ckpt_path=ckpt_path,
+                args=args,
+            ):
+                best_valid_loss = valid_loss['valid_loss']
 
-        # Run validation with random sampling
+        # Run validation (running inference) with random sampling
         if epoch % args.eval_epoch == 0:
             logger.info(f"===== Sampled validation at epoch {epoch} =====")
             validate_result = validate_model(
@@ -993,20 +1073,47 @@ if __name__ == "__main__":
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     # tokenizer
     processor = AutoProcessor.from_pretrained(args.tokenizer_model_name)
+    vocab_size_before = len(processor.tokenizer)
     # adding numbers from 0 to 9 + "[MASK]" if not already present
     additional_tokens = ["[", "]", ":", "_"]
     new_tokens = [str(i) for i in range(10)] + [args.mask_token] + additional_tokens
-    num_added = processor.tokenizer.add_tokens(new_tokens)
-    logger.info(f"{num_added} tokens added to the tokenizer.")
+    num_base_added = processor.tokenizer.add_tokens(new_tokens)
+    num_intent_added = 0
+    intent_tokens = []
+
+    # Optional: add intent-related tokens from INTENT file.
+    if args.use_intent_token:
+        intent_labels = _load_intent_labels(args.prompt_tag_path)        
+        intent_tokens = _build_intent_token_candidates(intent_labels)        
+        num_intent_added = processor.tokenizer.add_tokens(intent_tokens) if intent_tokens else 0
+
+    logger.info(f"{num_base_added} base tokens added to the tokenizer.")
+    if args.use_intent_token:
+        logger.info(
+            f"{num_intent_added} intent-related tokens added to the tokenizer "
+            f"(candidates={len(intent_tokens)})."
+        )
+    else:
+        logger.info("Intent-token injection disabled (use_intent_token=False).")
     tokenizer = processor.tokenizer
 
-    # num tokens 확인
+    # Always sync model vocab size with tokenizer after token injection.
     actual_vocab_size = len(tokenizer)
+    expected_vocab_size = vocab_size_before + num_base_added + num_intent_added
+    logger.info(
+        f"Tokenizer vocab size: {vocab_size_before} + {num_base_added} (base) + "
+        f"{num_intent_added} (intent) = {actual_vocab_size}"
+    )
+    if actual_vocab_size != expected_vocab_size:
+        logger.warning(
+            f"Tokenizer size check mismatch: expected {expected_vocab_size}, got {actual_vocab_size}."
+        )
     if actual_vocab_size != args.vocab_size:
-        logger.warning(f"vocab_size argument ({args.vocab_size}) "
-              f"does not match actual tokenizer vocab size ({actual_vocab_size}). "
-              f"Using actual vocab size.")
-        args.vocab_size = actual_vocab_size
+        logger.warning(
+            f"vocab_size argument ({args.vocab_size}) does not match tokenizer vocab size "
+            f"({actual_vocab_size}). Overriding args.vocab_size."
+        )
+    args.vocab_size = actual_vocab_size
 
     if args.use_self_prompt:
         cfg = SelfPromptARModelConfig(

@@ -14,8 +14,91 @@ from pyctcdecode import build_ctcdecoder
 import argparse
 from multiprocessing import Pool
 from functools import partial
+import torch.nn as nn
+from utils import replace_digit_in_spoken_text
 
 TARGET_SR = 16000
+
+
+def align_ctc_lm_head_to_tokenizer(model: HubertForCTC, tokenizer) -> None:
+    """HuBERT CTC의 lm_head out dim을 tokenizer vocab 크기에 맞춘다."""
+    target_vocab_size = len(tokenizer)
+    old_head = model.lm_head
+    if old_head.out_features == target_vocab_size:
+        return
+
+    new_head = nn.Linear(old_head.in_features, target_vocab_size)
+    with torch.no_grad():
+        copy_rows = min(old_head.out_features, target_vocab_size)
+        new_head.weight[:copy_rows] = old_head.weight[:copy_rows]
+        new_head.bias[:copy_rows] = old_head.bias[:copy_rows]
+    model.lm_head = new_head
+    model.config.vocab_size = target_vocab_size
+
+
+def resolve_asr_model_path(asr_model_path: Optional[str]) -> Optional[str]:
+    if not asr_model_path:
+        return None
+
+    # common typo compatibility: fintune_asr -> finetune_asr
+    normalized = asr_model_path.replace("fintune_asr", "finetune_asr")
+    path = Path(os.path.expanduser(normalized))
+    if path.is_absolute() and path.exists():
+        return str(path)
+
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        Path.cwd() / path,
+        script_dir / path,
+        script_dir.parent / path,
+    ]
+    for cand in candidates:
+        cand = cand.resolve()
+        if cand.exists():
+            return str(cand)
+    return None
+
+
+def load_asr_components(
+    model_name: str,
+    asr_model_path: Optional[str] = None,
+):
+    """
+    Load ASR model/processor.
+    - If asr_model_path points to a PEFT adapter directory, load base HuBERT + adapter.
+    - If it points to a full checkpoint directory, load directly.
+    - Otherwise, fall back to model_name.
+    """
+    resolved = resolve_asr_model_path(asr_model_path)
+
+    if resolved is None:
+        processor = AutoProcessor.from_pretrained(model_name)
+        model = HubertForCTC.from_pretrained(model_name)
+        align_ctc_lm_head_to_tokenizer(model, processor.tokenizer)
+        feature_extractor = processor.feature_extractor
+        print(f"ASR loaded from base model: {model_name}")
+        return feature_extractor, model, processor
+
+    adapter_cfg = Path(resolved) / "adapter_config.json"
+    if adapter_cfg.exists():
+        from peft import PeftModel
+
+        processor = AutoProcessor.from_pretrained(resolved)
+        base_model = HubertForCTC.from_pretrained(model_name)
+        # HuBERT CTC는 get_input_embeddings 미구현이므로 resize_token_embeddings 대신
+        # lm_head를 직접 vocab 크기에 맞춰야 한다.
+        align_ctc_lm_head_to_tokenizer(base_model, processor.tokenizer)
+        model = PeftModel.from_pretrained(base_model, resolved)
+        feature_extractor = processor.feature_extractor
+        print(f"ASR loaded from PEFT adapter: {resolved}")
+        return feature_extractor, model, processor
+
+    processor = AutoProcessor.from_pretrained(resolved)
+    model = HubertForCTC.from_pretrained(resolved)
+    align_ctc_lm_head_to_tokenizer(model, processor.tokenizer)
+    feature_extractor = processor.feature_extractor
+    print(f"ASR loaded from full checkpoint: {resolved}")
+    return feature_extractor, model, processor
 
 def normalize_text(s: str) -> str:
     # 1) 유니코드 정규화(특수 apostrophe 같은 거 통일)
@@ -116,6 +199,7 @@ def extract_and_save_hubert_features(
     manifest,
     cache_dir,
     model_name="facebook/hubert-large-ls960-ft",
+    asr_model_path=None,
     text_model_name="microsoft/deberta-v3-large",    
     batch_size=32,
     sr=16000,
@@ -132,9 +216,10 @@ def extract_and_save_hubert_features(
 
     # for audio feature
     # HF 권장: feature_extractor는 padding/attn_mask를 깔끔하게 만들어줌
-    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
-    model = HubertForCTC.from_pretrained(model_name)
-    processor = AutoProcessor.from_pretrained(model_name)
+    feature_extractor, model, processor = load_asr_components(
+        model_name=model_name,
+        asr_model_path=asr_model_path,
+    )
 
     # for text feature
     text_model = AutoModel.from_pretrained(text_model_name)
@@ -234,12 +319,13 @@ def extract_and_save_hubert_features(
 
         transcriptions = processor.batch_decode(pred_ids)
         ground_truth = manifest["utterance"][start:start+batch_size]
+        
         decoupled_normalized_seqlogical = manifest["decoupled_normalized_seqlogical"][start:start+batch_size].copy()
         seqlogical = manifest["seqlogical"][start:start+batch_size].copy()
-        
+
         for i in range(len(transcriptions)):
-            transcriptions[i] = normalize_text(transcriptions[i])
-            ground_truth[i] = normalize_text(ground_truth[i])
+            transcriptions[i] = normalize_text(replace_digit_in_spoken_text(transcriptions[i]))
+            ground_truth[i] = normalize_text(replace_digit_in_spoken_text(ground_truth[i]))
 
         n_best_hypotheses = []        
         if use_beam_search and all_hyps:
@@ -311,6 +397,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size for processing")
     parser.add_argument("--gpu", type=str, default="0", help="GPU ids separated by comma, e.g., '0,1,2'")
     parser.add_argument("--cache_dir", type=str, default="../data/slu/hubert_deberta_cache", help="Cache directory")
+    parser.add_argument("--asr_model_path", type=str, default="", help="Path to fine-tuned ASR checkpoint or PEFT adapter directory")
     parser.add_argument("--manifest_dir", type=str, default="~/work/DB/STOP/manifests", help="Manifest directory")
     parser.add_argument("--audio_prefix", type=str, default="~/work/DB/STOP", help="Audio file prefix directory")
     parser.add_argument("--use_beam_search", action="store_true", help="Enable CTC beam search (SLOW, disabled by default)")
@@ -343,6 +430,7 @@ if __name__ == "__main__":
             device="cuda" if gpu_ids else "cpu",
             manifest_type=key,
             audio_file_prefix=STOP_DIR,
+            asr_model_path=args.asr_model_path,
             gpu_ids=gpu_ids,
             use_beam_search=args.use_beam_search,
             num_workers=args.num_workers,

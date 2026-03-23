@@ -19,16 +19,16 @@ class SelfPromptARModelConfig:
     num_heads: int = 8
     audio_dim: int = 1024
     text_dim: int = 1024
-    num_intent: int = 162
+    num_intent: int = 80
     sos_token_id: int = 1
     eos_token_id: int = 2
     model_type: str = "transformer"  # "dit" or "transformer"
     norm_first: bool = True  # Whether to apply layer normalization before attention and FFN
     max_output_length: int = 256
     embed_dim: Optional[int] = None
-    length_hidden_dim: int = 128
+    length_hidden_dim: int = 512
     length_dropout: float = 0.2
-    prompt_tag_path: str = "data/slu/INTENT"
+    prompt_tag_path: str = "../data/slu/INTENT"
     top_k: int = 1
 
 
@@ -210,6 +210,7 @@ class SelfPromptARModel(nn.Module):
 
         k = max(1, min(int(top_k), self.cfg.num_intent))
         top_scores, top_ids = torch.topk(prompt_probs, k=k, dim=-1)
+        #print(f"{top_ids=}, {top_scores=}")
 
         retrieved_prompts = []
         for row in top_ids.tolist():
@@ -385,11 +386,11 @@ class SelfPromptARModel(nn.Module):
                 ids = tokenizer.encode(top_label)  # list[int]
                 prefix_id_list.append(ids)
 
-            # Pad to same length within the batch
+            # Pad to same length within the batch            
             max_p = max(len(ids) for ids in prefix_id_list)
             pad_id = getattr(tokenizer, "pad_token_id", 0)
             padded = [ids + [pad_id] * (max_p - len(ids)) for ids in prefix_id_list]
-            prompt_prefix_ids = torch.tensor(padded, dtype=torch.long)
+            prompt_prefix_ids = torch.tensor(padded, dtype=torch.long)            
 
         # ── Prompt-conditioned decode ─────────────────────────────────────────
         generated = self.decode_with_prompt(
@@ -419,8 +420,8 @@ if __name__ == "__main__":
     torch.manual_seed(42)
 
     B = 2
-    K = 650
-    T_out = 56
+    K = 50
+    T_out = 50
     D = 512
     n_H = 8
 
@@ -433,8 +434,8 @@ if __name__ == "__main__":
         num_heads=n_H,
         max_output_length=T_out,
         model_type="transformer",
-        num_intent=162,
-        length_hidden_dim=128,
+        num_intent=80,
+        length_hidden_dim=512,
         length_dropout=0.1,
     )
 
@@ -508,6 +509,15 @@ if __name__ == "__main__":
     print(f"    [0]=SOS({1}), [1..{P}]=prefix, [{P+1}..]=generated")
     print(f"  elapsed : {time.time() - t0:.3f}s")
 
+    # tokenizer
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
+    # adding numbers from 0 to 9 + "[MASK]" if not already present
+    additional_tokens = ["[", "]", ":", "_"]
+    new_tokens = [str(i) for i in range(10)] + ["[MASK]"] + additional_tokens
+    num_added = processor.tokenizer.add_tokens(new_tokens)    
+    tokenizer = processor.tokenizer
+
     # ── Test 5: decode_with_retrieval (full pipeline, no tokenizer) ──────────
     print("\n[Test 5] decode_with_retrieval()  (full pipeline, tokenizer=None)")
     result = model.decode_with_retrieval(
@@ -515,7 +525,7 @@ if __name__ == "__main__":
         text_feats=text_feats,
         audio_mask=audio_mask,
         text_mask=text_mask,
-        tokenizer=None,          # no tokenizer → prompt_prefix_ids=None
+        tokenizer=tokenizer,          # no tokenizer → prompt_prefix_ids=None
         top_k_retrieval=1,
         max_output_length=T_out,
         sos_id=1,
