@@ -36,7 +36,7 @@ class EncoderDecoderTransformer(nn.Module):
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.depth = depth
+        self.depth = depth if depth % 2 == 0 else depth + 1  # Ensure even depth for equal encoder/decoder layers
         self.norm_first = norm_first
 
         # ── Input projections ──────────────────────────────────────────────
@@ -55,7 +55,7 @@ class EncoderDecoderTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(
             encoder_layer,
-            num_layers=depth,
+            num_layers=depth//2,
             norm=nn.LayerNorm(hidden_size),
         )
 
@@ -73,7 +73,7 @@ class EncoderDecoderTransformer(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(
             decoder_layer,
-            num_layers=depth,
+            num_layers=depth//2,
             norm=nn.LayerNorm(hidden_size),
         )
 

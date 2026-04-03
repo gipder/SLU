@@ -6,6 +6,7 @@ from typing import Optional
 from basic_transformer import BasicTransformer
 from encoder_decoder_transformer import EncoderDecoderTransformer
 from fused_transformer import FusedTransformer
+from fused_decoder_only_transformer import FusedDecoderOnlyTransformer
 
 @dataclass
 class ARModelConfig:
@@ -18,8 +19,9 @@ class ARModelConfig:
     max_output_length: int = 256
     sos_token_id: int = 1
     eos_token_id: int = 2
-    model_type: str = "transformer"  # "transformer", "encoder_decoder_transformer", or "fused_transformer"
+    model_type: str = "transformer"  # "transformer", "encoder_decoder_transformer", "fused_transformer", or "fused_decoder_only_transformer"
     norm_first: bool = True
+    use_copy: bool = False  # Enable copy mechanism (fused_transformer / fused_decoder_only_transformer only)
 
 
 class ARModel(nn.Module):
@@ -37,6 +39,7 @@ class ARModel(nn.Module):
             audio_dim=cfg.audio_dim,
             text_dim=cfg.text_dim,
             max_output_length=cfg.max_output_length,
+            norm_first=cfg.norm_first,
         )
 
         if cfg.model_type == "transformer":
@@ -46,8 +49,11 @@ class ARModel(nn.Module):
             self.encoder_decoder_transformer = EncoderDecoderTransformer(**_common)
             self.slu_model = self.encoder_decoder_transformer
         elif cfg.model_type == "fused_transformer":
-            self.fused_transformer = FusedTransformer(**_common)
+            self.fused_transformer = FusedTransformer(**_common, use_copy=cfg.use_copy)
             self.slu_model = self.fused_transformer
+        elif cfg.model_type == "fused_decoder_only_transformer":
+            self.fused_decoder_only_transformer = FusedDecoderOnlyTransformer(**_common, use_copy=cfg.use_copy)
+            self.slu_model = self.fused_decoder_only_transformer
         else:
             raise ValueError(f"Unknown model_type: {cfg.model_type}")
 
@@ -67,29 +73,39 @@ class ARModel(nn.Module):
         audio_mask: torch.Tensor = None,
         text_feats: torch.Tensor = None,
         text_mask: torch.Tensor = None,
+        copy_ids: Optional[torch.Tensor] = None,
+        copy_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # x_t: B, T
         B = input_ids.shape[0]
         T = input_ids.shape[1]
         K = self.cfg.vocab_size
 
+        # copy kwargs forwarded only to models that support it
+        copy_kwargs = {}
+        if self.cfg.use_copy:
+            copy_kwargs = {"copy_ids": copy_ids, "copy_mask": copy_mask}
+
         if audio_feats is None and audio_mask is None:
             logits = self.slu_model(
                 input_ids,
                 None, text_feats,
-                None, ~(text_mask.bool())
+                None, ~(text_mask.bool()),
+                **copy_kwargs
             )
         elif text_feats is None and text_mask is None:
             logits = self.slu_model(
                 input_ids,
                 audio_feats, None,
-                ~(audio_mask.bool()), None
+                ~(audio_mask.bool()), None,
+                **copy_kwargs
             )
         else:
             logits = self.slu_model(
                 input_ids,
                 audio_feats, text_feats,
-                ~(audio_mask.bool()), ~(text_mask.bool())
+                ~(audio_mask.bool()), ~(text_mask.bool()),
+                **copy_kwargs
             )
         return logits
 
@@ -108,22 +124,31 @@ class ARModel(nn.Module):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         device: Optional[torch.device] = None,
+        copy_ids: Optional[torch.Tensor] = None,
+        copy_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+
+        copy_kwargs = {}
+        if self.cfg.use_copy:
+            copy_kwargs = {"copy_ids": copy_ids, "copy_mask": copy_mask}
 
         if audio_feats is None and audio_mask is None:
             return self.slu_model.decode(
                 None, text_feats, None, ~(text_mask.bool()),
-                max_output_length, sos_id, eos_id, use_cache=use_cache, device=device
+                max_output_length, sos_id, eos_id, use_cache=use_cache, device=device,
+                **copy_kwargs
             )
         elif text_feats is None and text_mask is None:
             return self.slu_model.decode(
                 audio_feats, None, ~(audio_mask.bool()), None,
-                max_output_length, sos_id, eos_id, use_cache=use_cache, device=device
+                max_output_length, sos_id, eos_id, use_cache=use_cache, device=device,
+                **copy_kwargs
             )
 
         return self.slu_model.decode(
             audio_feats, text_feats, ~(audio_mask.bool()), ~(text_mask.bool()),
-            max_output_length, sos_id, eos_id, use_cache=use_cache, device=device
+            max_output_length, sos_id, eos_id, use_cache=use_cache, device=device,
+            **copy_kwargs
         )
 
 if __name__ == "__main__":
@@ -171,4 +196,3 @@ if __name__ == "__main__":
     )
 
     print(f"decoded_ids: {decoded_ids.shape}")
-    #print(f"length_logits: {length_logits.shape}")

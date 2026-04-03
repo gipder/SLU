@@ -98,8 +98,13 @@ def build_parser():
     p.add_argument("--audio_dim", type=int, default=1024)
     p.add_argument("--text_dim", type=int, default=1024)
     p.add_argument("--max_output_length", type=int, default=512)
-    p.add_argument("--model_type", type=str, choices=["transformer", "encoder_decoder_transformer", "fused_transformer"], default="transformer")
-    p.add_argument("--norm_first", type=str2bool, default=True, help="Whether to apply layer normalization before attention and FFN")    
+    p.add_argument("--model_type", type=str, choices=["transformer", "encoder_decoder_transformer", "fused_transformer", "fused_decoder_only_transformer"], default="transformer")
+    p.add_argument("--norm_first", type=str2bool, default=True, help="Whether to apply layer normalization before attention and FFN")
+    p.add_argument("--use_copy", type=str2bool, default=False,
+                   help="Enable copy mechanism (fused_transformer / fused_decoder_only_transformer only). "
+                        "Uses batch['hyp'] (ASR hypothesis token IDs) as copy source.")
+    p.add_argument("--condition_type", type=str, choices=["both", "audio", "text"], default="both",
+                   help="Type of conditioning for the model")
 
     ## for length predictor
     #p.add_argument("--embed_dim", type=int, default=1024)
@@ -219,6 +224,17 @@ def eval_model(
             slus = slus.to(device)
             slu_mask = slu_mask.to(device)
 
+            copy_ids = copy_mask_eval = None
+            if args.use_copy:
+                copy_ids = batch["hyp"].to(device)
+                copy_mask_eval = ~batch["hyp_mask"].bool().to(device)
+
+            # Apply condition_type: zero out unused modalities
+            if args.condition_type == "audio":
+                text_feats, text_feat_mask = None, None
+            elif args.condition_type == "text":
+                audio_feats, audio_feat_mask = None, None
+
             generated = model.decode(
                 audio_feats=audio_feats,
                 text_feats=text_feats,
@@ -226,9 +242,11 @@ def eval_model(
                 text_mask=text_feat_mask,
                 max_output_length=args.max_output_length,
                 sos_id=sos_id,
-                eos_id=eos_id,  
-                use_cache=args.use_cache,              
+                eos_id=eos_id,
+                use_cache=args.use_cache,
                 device=device,
+                copy_ids=copy_ids,
+                copy_mask=copy_mask_eval,
             )
 
             hyp_ids.extend(generated.cpu().tolist())
@@ -238,7 +256,7 @@ def eval_model(
             str_slus.extend(str_slu_targets)
 
             step += 1
-            count += audio_feats.size(0)
+            count += generated.size(0)
 
             if args.verbose:
                 logger.info(f"{slus=}")
@@ -377,10 +395,11 @@ def main(args):
         num_heads=args.num_heads,
         audio_dim=args.audio_dim,
         text_dim=args.text_dim,
-        max_output_length=args.max_output_length,           
+        max_output_length=args.max_output_length,
         model_type=args.model_type,
         norm_first=args.norm_first,
-    )        
+        use_copy=args.use_copy,
+    )
 
     logger.info(f"* Model Config: {class_name(cfg)}")
     logger.info(json.dumps(asdict(cfg), indent=2))

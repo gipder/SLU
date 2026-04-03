@@ -81,8 +81,12 @@ def build_parser():
     p.add_argument("--max_output_length", type=int, default=512, help="Maximum output length during inference")
     #p.add_argument("--noise_ratio", type=float, default=0.5, help="Noise ratio for UniformDiscreteProbPath")
     #p.add_argument("--n_step", type=int, default=5, help="Number of sampling steps during inference")
-    p.add_argument("--model_type", type=str, choices=["transformer", "encoder_decoder_transformer", "fused_transformer"], default="transformer")
+    p.add_argument("--model_type", type=str, choices=["transformer", "encoder_decoder_transformer", "fused_transformer", "fused_decoder_only_transformer"], default="transformer")
     p.add_argument("--norm_first", type=str2bool, default=True, help="Whether to apply layer normalization before attention and FFN")
+    p.add_argument("--use_copy", type=str2bool, default=False,
+                   help="Enable copy mechanism (fused_transformer / fused_decoder_only_transformer only). "
+                        "Uses batch['hyp'] (ASR hypothesis token IDs) as copy source. "
+                        "Model forward returns log-probs; loss switches to NLLLoss automatically.")
     p.add_argument("--condition_type", type=str, choices=["both", "audio", "text"], default="both", help="Type of conditioning for the model")
     ## for length predictor
     #p.add_argument("--embed_dim", type=int, default=1024)
@@ -612,6 +616,13 @@ def compute_valid_loss(
 
     every_n = max(1, len(val_loader) // 4)
 
+    # use_copy → NLLLoss, else CrossEntropyLoss
+    val_criterion = (
+        nn.NLLLoss(reduction="none")
+        if getattr(args, 'use_copy', False)
+        else nn.CrossEntropyLoss(reduction="none")
+    )
+
     tag_patterns = []
     if getattr(args, 'use_self_prompt', False):
         m = _get_base_model(model)
@@ -649,6 +660,11 @@ def compute_valid_loss(
             slus = slus.to(device)
             slu_mask = slu_mask.to(device)
 
+            val_copy_ids = val_copy_mask = None
+            if getattr(args, 'use_copy', False):
+                val_copy_ids = batch["hyp"].to(device)
+                val_copy_mask = ~batch["hyp_mask"].bool().to(device)
+
             B = slus.size(0)
             lengths = slu_mask.sum(dim=1)  # B,
             T = lengths.max().item()  # max target length in the batch
@@ -674,7 +690,9 @@ def compute_valid_loss(
                             audio_feats=audio_feats,
                             audio_mask=audio_feat_mask,
                             text_feats=text_feats,
-                            text_mask=text_feat_mask)
+                            text_mask=text_feat_mask,
+                            copy_ids=val_copy_ids,
+                            copy_mask=val_copy_mask)
                 if isinstance(out, tuple):
                     logits, prompt_logits = out
                 else:
@@ -682,7 +700,7 @@ def compute_valid_loss(
                     prompt_logits = None
 
                 logits_perm = logits.permute(0, -1, 1)
-                ar_loss = criterion(logits_perm, target_ids)
+                ar_loss = val_criterion(logits_perm, target_ids)
                 mask = input_mask.float()
                 if getattr(args, 'use_self_prompt', False) and prompt_prefix_lengths is not None:
                     for b in range(B):
@@ -776,16 +794,20 @@ def train_model(
     use_cuda = "cuda" in device_str
     scaler = GradScaler(enabled=use_cuda)
 
-    criterion = nn.CrossEntropyLoss(reduction="none")
+    # use_copy → model returns log-probs, so switch to NLLLoss
+    if getattr(args, 'use_copy', False):
+        criterion = nn.NLLLoss(reduction="none")
+    else:
+        criterion = nn.CrossEntropyLoss(reduction="none")
 
-    loss_ema = None
+    loss_ema = init_condition.get("loss_ema", None) if init_condition else None
     ema_beta = getattr(args, "loss_ema_beta", 0.98)
 
     step = init_condition.get("step", 1) if init_condition is not None else 1
     init_epoch = init_condition.get("epoch", 1) if init_condition is not None else 1
 
-    best_valid_loss = float("inf")
-    best_em = 0.0  # EM (exact matching) is higher is better
+    best_valid_loss = init_condition.get("best_valid_loss", float("inf")) if init_condition else float("inf")
+    best_em = init_condition.get("best_em", 0.0) if init_condition else 0.0  # EM (exact matching) is higher is better
 
     # TAG token patterns: use_self_prompt 활성 시 predict_intent_loss 계산에 사용
     tag_patterns = []
@@ -818,6 +840,11 @@ def train_model(
             text_feat_mask = text_feat_mask.to(device)
             slus = slus.to(device)
             slu_mask = slu_mask.to(device)
+
+            copy_ids = copy_mask_batch = None
+            if getattr(args, 'use_copy', False):
+                copy_ids = batch["hyp"].to(device)
+                copy_mask_batch = ~batch["hyp_mask"].bool().to(device)  # True = padded
 
             if augmentor is not None:
                 audio_feats, text_feats, audio_feat_mask, text_feat_mask = augmentor.apply(
@@ -862,9 +889,11 @@ def train_model(
                             audio_feats=audio_feats,
                             audio_mask=audio_feat_mask,
                             text_feats=text_feats,
-                            text_mask=text_feat_mask)
-                
-                if isinstance(out, tuple):                    
+                            text_mask=text_feat_mask,
+                            copy_ids=copy_ids,
+                            copy_mask=copy_mask_batch)
+
+                if isinstance(out, tuple):
                     logits, prompt_logits = out
                 else:
                     logits = out
@@ -956,18 +985,23 @@ def train_model(
         torch.save(
             {
                 "step": step,
+                "epoch": epoch,
                 "model": model.state_dict(),
                 "optim": optim.state_dict(),
+                "scheduler": optim_scheduler.state_dict(),
                 "scaler": scaler.state_dict(),
-                "epoch": epoch,
+                "best_valid_loss": best_valid_loss,
+                "best_em": best_em,
+                "loss_ema": loss_ema,
             },
             ckpt_path,
         )
         logger.info(f"Saved: {ckpt_path}")
 
         # check validation (validation loss only)
+        """
         if epoch % args.eval_epoch == 0:
-            logger.info(f"===== Valid Loss Calculation at epoch {epoch} =====")
+            logger.info(f'===== Valid Loss Calculation at epoch {epoch} =====')
             valid_loss = compute_valid_loss(
                 model=model,
                 eval_dataset=eval_dataset,
@@ -984,13 +1018,14 @@ def train_model(
             if update_best_model_link(
                 metric_value=valid_loss['valid_loss'],
                 best_metric_value=best_valid_loss,
-                metric_name="valid_loss",
+                metric_name='valid_loss',
                 is_better_fn=lambda x, y: x < y,  # lower loss is better
                 save_dir=save_dir,
                 ckpt_path=ckpt_path,
                 args=args,
             ):
                 best_valid_loss = valid_loss['valid_loss']
+        """
 
         # Run validation (running inference) with random sampling
         if epoch % args.eval_epoch == 0:
@@ -1154,6 +1189,7 @@ if __name__ == "__main__":
             max_output_length=args.max_output_length,
             model_type=args.model_type,
             norm_first=args.norm_first,
+            use_copy=args.use_copy,
         )
         logger.info(f"* ARModelConfig: ")
         logger.info(json.dumps(asdict(cfg), indent=2))
@@ -1236,13 +1272,41 @@ if __name__ == "__main__":
 
     init_condition = {}
     if args.ckpt_path is not None:
-        optim.load_state_dict(checkpoint["optim"])
-        scaler.load_state_dict(checkpoint["scaler"])
+        if "optim" in checkpoint:
+            optim.load_state_dict(checkpoint["optim"])
+            logger.info("  -> optimizer state loaded")
+        else:
+            logger.warning("  -> 'optim' key missing in checkpoint; optimizer state NOT loaded")
+
+        if "scheduler" in checkpoint:
+            optim_scheduler.load_state_dict(checkpoint["scheduler"])
+            logger.info(f"  -> scheduler state loaded (last_epoch={optim_scheduler.last_epoch}, "
+                        f"lr={optim_scheduler.get_last_lr()[0]:.6f})")
+        else:
+            # Backward-compat: checkpoint saved before scheduler state was added.
+            # Fast-forward the scheduler to the saved step so the LR is correct.
+            saved_step = checkpoint.get("step", 0)
+            for _ in range(saved_step):
+                optim_scheduler.step()
+            logger.warning(f"  -> 'scheduler' key missing; fast-forwarded scheduler "
+                           f"{saved_step} steps to recover LR "
+                           f"({optim_scheduler.get_last_lr()[0]:.6f})")
+
+        if "scaler" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler"])
+            logger.info("  -> scaler state loaded")
+        else:
+            logger.warning("  -> 'scaler' key missing in checkpoint; scaler state NOT loaded")
+
         init_condition["step"] = checkpoint.get("step", 0) + 1
         init_condition["epoch"] = checkpoint.get("epoch", 0) + 1
-        logger.info(f"* Loaded optimizer and scaler states from {args.ckpt_path}, "
-                    f"resuming from step {init_condition['step']}, "
-                    f"epoch {init_condition['epoch']}. ")
+        init_condition["best_valid_loss"] = checkpoint.get("best_valid_loss", float("inf"))
+        init_condition["best_em"] = checkpoint.get("best_em", 0.0)
+        init_condition["loss_ema"] = checkpoint.get("loss_ema", None)
+        logger.info(f"* Resuming from step {init_condition['step']}, "
+                    f"epoch {init_condition['epoch']} | "
+                    f"best_valid_loss={init_condition['best_valid_loss']:.4f}, "
+                    f"best_em={init_condition['best_em']:.4f}")
 
     train_dataset = HuBERTandDeBERTaDataset(
         task=args.train_task,

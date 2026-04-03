@@ -363,3 +363,46 @@ def class_name(obj) -> str:
     :rtype: str
     """
     return type(obj).__name__
+
+
+EXTRA_TOKENS = [str(d) for d in range(10)]  # 0-9
+
+_ONES = [
+    "zero", "one", "two", "three", "four",
+    "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen",
+    "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+
+def _int_to_words(n: int) -> str:
+    """Convert a non-negative integer to its English spoken form."""
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        tens, ones = divmod(n, 10)
+        return _TENS[tens] if ones == 0 else f"{_TENS[tens]} {_ONES[ones]}"
+    if n < 1000:
+        hundreds, rest = divmod(n, 100)
+        tail = f" {_int_to_words(rest)}" if rest else ""
+        return f"{_ONES[hundreds]} hundred{tail}"
+    # For larger numbers, fall back to spelling each digit individually
+    return " ".join(_ONES[int(d)] for d in str(n))
+
+
+def replace_digit_in_spoken_text(text: str) -> str:
+    """Replace digit sequences in text with their spoken-word equivalents.
+
+    Example:
+        "Have 5 minutes past yet"  -> "Have five minutes past yet"
+        "snooze 10 more minutes"   -> "snooze ten more minutes"
+        "Set alarm for 7am"        -> "Set alarm for seven am"
+    """
+    def replace_number(m):
+        word = _int_to_words(int(m.group(1)))
+        suffix = m.group(2)  # letter(s) immediately after the number, e.g. "am", "s"
+        return f"{word} {suffix}" if suffix else word
+
+    # Capture trailing letters attached to the number (e.g. "7am", "90s")
+    return re.sub(r"(\d+)([a-zA-Z]*)", replace_number, text)
